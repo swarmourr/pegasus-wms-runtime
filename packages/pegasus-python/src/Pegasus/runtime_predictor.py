@@ -706,51 +706,54 @@ class WorkflowRuntimePredictor:
 
     def _inject_into_dag(self, workflow, output_dir: str) -> None:
         """
-        Inject a ``pegasus-runtime-predictor`` job into the workflow DAG as a
-        native Pegasus infrastructure job — same pattern as stage-in/stage-out.
+        Inject ONE ``pegasus-runtime-predictor`` job per DAG level.
 
-        * Runs on the ``local`` site (never staged to the compute site)
-        * Marked ``pegasus.job.type = auxillary`` so Pegasus treats it as
-          an infrastructure job
-        * All level-0 (root) user jobs become children of this job — they
-          cannot start until the prediction file is available
-        * Outputs ``runtime_predictions.json`` and ``runtime_predictions.csv``
-          as real DAG file nodes
+        Like stage-in (one per level), each prediction job:
+        - Runs BEFORE all user jobs at that level
+        - Runs AFTER all user jobs at the previous level
+        - Outputs level-specific runtime_predictions_L{N}.json/.csv
+
+        DAG shape after injection:
+            [pred-L0] → [user-L0-jobs]
+                              ↓
+                        [pred-L1] → [user-L1-jobs]
+                                          ↓
+                                    [pred-L2] → [user-L2-jobs]
         """
         import logging as _log
         _logger = _log.getLogger(__name__)
 
-        from Pegasus.api import File, Job, Namespace  # local import, no circular dep
+        from Pegasus.api import File, Job, Namespace
 
-        # Find root jobs BEFORE injection (level 0 = no upstream dependencies)
         levels = _build_dag_levels(workflow)
         if not levels:
-            _logger.warning("[runtime-predictor] DAG is empty — skipping job injection")
+            _logger.warning("[runtime-predictor] DAG is empty — skipping")
             return
-        root_job_ids = [jid for jid, _ in levels[0]]
-        _logger.info(
-            f"[runtime-predictor] Injecting prediction job before {len(root_job_ids)} root job(s): {root_job_ids}"
-        )
 
-        # Build the native prediction job
-        pred_json = File("runtime_predictions.json")
-        pred_csv  = File("runtime_predictions.csv")
+        prev_pred_job = None
+        for level_idx, level in enumerate(levels):
+            level_job_ids = [jid for jid, _ in level]
 
-        pred_job = (
-            Job("pegasus-runtime-predictor")
-            .add_args("workflow.yml", output_dir)
-            .add_outputs(pred_json, pred_csv, stage_out=True, register_replica=False)
-            # Mark as Pegasus infrastructure job (auxillary = planner-generated)
-            .add_profiles(Namespace.PEGASUS, key="job.type",  value="auxillary")
-            .add_profiles(Namespace.PEGASUS, key="label",     value="runtime-prediction")
-            # Run locally — same site as stage-in/stage-out
-            .add_profiles(Namespace.PEGASUS, key="execution.site", value="local")
-        )
+            pred_json = File(f"runtime_predictions_L{level_idx}.json")
+            pred_csv  = File(f"runtime_predictions_L{level_idx}.csv")
 
-        workflow.add_jobs(pred_job)
-        _logger.info(f"[runtime-predictor] Added job {pred_job._id} to workflow ({len(workflow.jobs)} total jobs)")
+            pred_job = (
+                Job("pegasus-runtime-predictor")
+                .add_args("workflow.yml", output_dir, f"--level={level_idx}")
+                .add_outputs(pred_json, pred_csv, stage_out=True, register_replica=False)
+                .add_profiles(Namespace.PEGASUS, key="job.type", value="auxillary")
+                .add_profiles(Namespace.PEGASUS, key="label",    value=f"runtime-prediction-L{level_idx}")
+            )
 
-        # Wire: prediction_job → every root user job  (same as stage-in → user jobs)
-        for root_id in root_job_ids:
-            workflow.add_dependency(pred_job, children=[workflow.jobs[root_id]])
-            _logger.info(f"[runtime-predictor] Dependency: {pred_job._id} → {root_id}")
+            workflow.add_jobs(pred_job)
+            _logger.info(f"[runtime-predictor] Level {level_idx}: added {pred_job._id}")
+
+            # pred-LN → user jobs at level N
+            for jid in level_job_ids:
+                workflow.add_dependency(pred_job, children=[workflow.jobs[jid]])
+
+            # user jobs at level N-1 → pred-LN  (so pred-LN runs between levels)
+            if prev_pred_job is not None:
+                workflow.add_dependency(prev_pred_job, children=[pred_job])
+
+            prev_pred_job = pred_job

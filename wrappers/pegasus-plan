@@ -1,134 +1,93 @@
 #!/usr/bin/env python3
 """
 pegasus-plan wrapper — injects runtime prediction as a native DAG job.
+Intercepts every pegasus-plan call, injects pegasus-runtime-predictor
+(like stage-in/cleanup), then delegates to the real Java planner.
 
-Intercepts every `pegasus-plan` invocation, injects a
-`pegasus-runtime-predictor` job into the workflow (like stage-in/cleanup),
-then delegates to the real Java pegasus-plan.
-
-Install: put this directory BEFORE $PEGASUS_HOME/bin in PATH.
-The real planner is found via $PEGASUS_HOME/bin/pegasus-plan.
+PATH setup: this file lives in  <install>/pegasus-wms-runtime-src/wrappers/
+Packages live in                <install>/pegasus-wms-runtime-src/packages/
 """
-
 import os
 import sys
-import subprocess
 import yaml
-import tempfile
 from pathlib import Path
 
-# ── Path setup ────────────────────────────────────────────────────────────────
-_BIN_DIR      = Path(__file__).resolve().parent
-_WF_DIR       = _BIN_DIR.parent
-_PEGASUS_ROOT = _WF_DIR / "PegasusIntegration" / "pegasus" / "packages"
+# ── Path setup (packages are sibling of wrappers/) ───────────────────────────
+_SRC_DIR = Path(__file__).resolve().parent.parent   # pegasus-wms-runtime-src/
 for _pkg in ("pegasus-api", "pegasus-common", "pegasus-python", "pegasus-worker"):
-    _p = _PEGASUS_ROOT / _pkg / "src"
+    _p = _SRC_DIR / "packages" / _pkg / "src"
     if _p.exists():
         sys.path.insert(0, str(_p))
 
-# ── Find the real pegasus-plan ────────────────────────────────────────────────
-def _real_pegasus_plan() -> str:
+# ── Find the real Java pegasus-plan ──────────────────────────────────────────
+def _real_pegasus_plan():
     pegasus_home = os.environ.get("PEGASUS_HOME")
     if pegasus_home:
         real = Path(pegasus_home) / "bin" / "pegasus-plan"
         if real.exists():
             return str(real)
-    # Fallback: search PATH skipping this wrapper
-    this_bin = str(_BIN_DIR)
+    this_bin = str(Path(__file__).parent)
     for d in os.environ.get("PATH", "").split(":"):
         if d == this_bin:
             continue
         candidate = Path(d) / "pegasus-plan"
-        if candidate.exists() and candidate.is_file():
+        if candidate.exists():
             return str(candidate)
-    raise FileNotFoundError(
-        "Cannot find the real pegasus-plan. Make sure PEGASUS_HOME is set."
-    )
+    raise FileNotFoundError("Cannot find real pegasus-plan. Make sure PEGASUS_HOME is set.")
 
 # ── Find workflow YAML in argv ────────────────────────────────────────────────
-def _find_workflow_yaml(args) -> str | None:
+def _find_workflow_yaml(args):
     for arg in args:
-        if arg.endswith(".yml") or arg.endswith(".yaml"):
-            if Path(arg).exists():
-                return arg
+        if (arg.endswith(".yml") or arg.endswith(".yaml")) and Path(arg).exists():
+            return arg
     return None
 
 # ── Inject prediction job into workflow YAML ──────────────────────────────────
-def _inject_prediction(workflow_yml: str) -> bool:
-    """
-    Load workflow YAML → run WorkflowRuntimePredictor (which calls _inject_into_dag)
-    → write the modified workflow back to the same file.
-
-    Returns True if injection succeeded.
-    """
+def _inject_prediction(workflow_yml):
     try:
         from Pegasus.api import File, Job, Namespace, Workflow
         from Pegasus.runtime_predictor import RuntimePredictionConfig, WorkflowRuntimePredictor
 
-        # Load workflow from YAML
         with open(workflow_yml) as f:
             raw = yaml.safe_load(f)
 
-        wf_name = raw.get("name", "workflow")
-        wf = Workflow(wf_name, infer_dependencies=False)
-
+        wf = Workflow(raw.get("name", "workflow"), infer_dependencies=False)
         for jdata in raw.get("jobs", []):
-            jid   = jdata.get("id", "")
-            trans = jdata.get("name", jdata.get("transformation", "unknown"))
-            job   = Job(trans, _id=jid)
-
+            job = Job(jdata.get("name", jdata.get("transformation", "unknown")),
+                      _id=jdata.get("id", ""))
             for u in jdata.get("uses", []):
-                f = File(u["lfn"])
-                if u.get("size"):
-                    try:
-                        f.size = int(u["size"])
-                    except (ValueError, TypeError):
-                        pass
+                fi = File(u["lfn"])
+                try:
+                    if u.get("size"):
+                        fi.size = int(u["size"])
+                except (ValueError, TypeError):
+                    pass
                 if u.get("type") == "input":
-                    job.add_inputs(f)
+                    job.add_inputs(fi)
                 elif u.get("type") == "output":
-                    job.add_outputs(f)
-
-            for ns_key, profs in jdata.get("profiles", {}).items():
-                if ns_key == "condor":
-                    for k, v in profs.items():
-                        job.add_profiles(Namespace.CONDOR, **{k: str(v)})
-
+                    job.add_outputs(fi)
+            for k, v in jdata.get("profiles", {}).get("condor", {}).items():
+                job.add_profiles(Namespace.CONDOR, **{k: str(v)})
             wf.add_jobs(job)
 
         for dep in raw.get("dependencies", []):
-            parent_id = dep.get("id")
             for child_id in dep.get("children", []):
-                wf.add_dependency(wf.jobs[parent_id], children=[wf.jobs[child_id]])
+                wf.add_dependency(wf.jobs[dep["id"]], children=[wf.jobs[child_id]])
 
-        # Run predictor — this injects the native DAG job automatically
         output_dir = str(Path(workflow_yml).parent / "output")
-        cfg = RuntimePredictionConfig(enabled=True, output_dir=output_dir)
-        WorkflowRuntimePredictor(cfg).predict(wf)
-
-        # Write modified workflow back (overwrite in-place)
+        WorkflowRuntimePredictor(
+            RuntimePredictionConfig(enabled=True, output_dir=output_dir)
+        ).predict(wf)
         wf.write(file=workflow_yml)
-        print(f"[pegasus-plan] Runtime prediction job injected into {workflow_yml}", flush=True)
-        return True
-
+        print("[pegasus-plan] Runtime prediction job injected.", flush=True)
     except Exception as e:
         print(f"[pegasus-plan] Runtime prediction skipped: {e}", flush=True)
-        return False
-
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    args = sys.argv[1:]
+args = sys.argv[1:]
+wf_yaml = _find_workflow_yaml(args)
+if wf_yaml:
+    _inject_prediction(wf_yaml)
 
-    # Inject prediction into the workflow YAML (if found in args)
-    wf_yaml = _find_workflow_yaml(args)
-    if wf_yaml:
-        _inject_prediction(wf_yaml)
-
-    # Delegate to the real Java planner
-    real = _real_pegasus_plan()
-    os.execv(real, [real] + args)
-
-
-if __name__ == "__main__":
-    main()
+real = _real_pegasus_plan()
+os.execv(real, [real] + args)

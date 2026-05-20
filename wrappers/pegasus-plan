@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
 pegasus-plan wrapper — injects runtime prediction as a native DAG job.
-Intercepts every pegasus-plan call, injects pegasus-runtime-predictor
-(like stage-in/cleanup), then delegates to the real Java planner.
 
-PATH setup: this file lives in  <install>/pegasus-wms-runtime-src/wrappers/
-Packages live in                <install>/pegasus-wms-runtime-src/packages/
+Intercepts every pegasus-plan call:
+  1. Injects pegasus-runtime-predictor Job into workflow.yml (like stage-in)
+  2. Adds its TC entry for every --sites execution site with
+     condor.universe=local so it always runs on the submit machine
+  3. Delegates to the real Java planner
+
+PATH: this file lives in <install>/pegasus-wms-runtime-src/wrappers/
+      Packages live in  <install>/pegasus-wms-runtime-src/packages/
 """
 import os
 import sys
 import yaml
 from pathlib import Path
 
-# ── Path setup (packages are sibling of wrappers/) ───────────────────────────
+# ── Path setup ────────────────────────────────────────────────────────────────
 _SRC_DIR = Path(__file__).resolve().parent.parent   # pegasus-wms-runtime-src/
 for _pkg in ("pegasus-api", "pegasus-common", "pegasus-python", "pegasus-worker"):
     _p = _SRC_DIR / "packages" / _pkg / "src"
     if _p.exists():
         sys.path.insert(0, str(_p))
 
-# ── Find the real Java pegasus-plan ──────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def _real_pegasus_plan():
     pegasus_home = os.environ.get("PEGASUS_HOME")
     if pegasus_home:
@@ -35,15 +39,66 @@ def _real_pegasus_plan():
             return str(candidate)
     raise FileNotFoundError("Cannot find real pegasus-plan. Make sure PEGASUS_HOME is set.")
 
-# ── Find workflow YAML in argv ────────────────────────────────────────────────
 def _find_workflow_yaml(args):
     for arg in args:
         if (arg.endswith(".yml") or arg.endswith(".yaml")) and Path(arg).exists():
             return arg
     return None
 
-# ── Inject prediction job into workflow YAML ──────────────────────────────────
-def _inject_prediction(workflow_yml):
+def _parse_sites(args):
+    """Extract --sites value(s) from pegasus-plan arguments."""
+    sites = []
+    for i, arg in enumerate(args):
+        if arg in ("--sites", "-s") and i + 1 < len(args):
+            sites.extend(args[i + 1].split(","))
+        elif arg.startswith("--sites="):
+            sites.extend(arg.split("=", 1)[1].split(","))
+    return [s.strip() for s in sites if s.strip()]
+
+def _find_tc_yml(workflow_yml):
+    """Look for tc.yml next to the workflow file."""
+    tc = Path(workflow_yml).parent / "tc.yml"
+    return str(tc) if tc.exists() else None
+
+def _inject_tc_entry(tc_yml, sites, pfn):
+    """
+    Add pegasus-runtime-predictor to tc.yml for every execution site
+    with condor.universe=local so it runs on the submit machine.
+    """
+    with open(tc_yml) as f:
+        data = yaml.safe_load(f) or {}
+
+    data.setdefault("pegasus", "5.0")
+    data.setdefault("transformations", [])
+
+    # Find or create the pegasus-runtime-predictor entry
+    pred_entry = next(
+        (t for t in data["transformations"] if t.get("name") == "pegasus-runtime-predictor"),
+        None,
+    )
+    if pred_entry is None:
+        pred_entry = {"name": "pegasus-runtime-predictor", "sites": []}
+        data["transformations"].append(pred_entry)
+
+    existing_sites = {s["name"] for s in pred_entry.get("sites", [])}
+    for site in sites:
+        if site not in existing_sites:
+            pred_entry["sites"].append({
+                "name":    site,
+                "pfn":     pfn,
+                "type":    "installed",
+                "profiles": {
+                    # condor.universe=local = runs on submit machine,
+                    # same as stage-in/stage-out/cleanup
+                    "condor": {"universe": "local"},
+                },
+            })
+
+    with open(tc_yml, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+# ── Prediction injection ──────────────────────────────────────────────────────
+def _inject_prediction(workflow_yml, sites):
     try:
         from Pegasus.api import File, Job, Namespace, Workflow
         from Pegasus.runtime_predictor import RuntimePredictionConfig, WorkflowRuntimePredictor
@@ -79,15 +134,24 @@ def _inject_prediction(workflow_yml):
             RuntimePredictionConfig(enabled=True, output_dir=output_dir)
         ).predict(wf)
         wf.write(file=workflow_yml)
+
+        # Add TC entry for every execution site with condor.universe=local
+        tc_yml = _find_tc_yml(workflow_yml)
+        pfn = str(_SRC_DIR / "bin" / "pegasus-runtime-predictor")
+        if tc_yml and sites:
+            _inject_tc_entry(tc_yml, sites, pfn)
+            print(f"[pegasus-plan] TC entry added for sites: {sites}", flush=True)
+
         print("[pegasus-plan] Runtime prediction job injected.", flush=True)
     except Exception as e:
         print(f"[pegasus-plan] Runtime prediction skipped: {e}", flush=True)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-args = sys.argv[1:]
+args  = sys.argv[1:]
+sites = _parse_sites(args)
 wf_yaml = _find_workflow_yaml(args)
 if wf_yaml:
-    _inject_prediction(wf_yaml)
+    _inject_prediction(wf_yaml, sites)
 
 real = _real_pegasus_plan()
 os.execv(real, [real] + args)

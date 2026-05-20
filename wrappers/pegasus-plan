@@ -50,6 +50,15 @@ def _real_pegasus_plan() -> str:
 
 def _find_dag_file(plan_output: str) -> str | None:
     """Parse pegasus-plan stdout/stderr to locate the generated .dag file."""
+    # Best match: line with the full absolute path
+    m = re.search(
+        r'Successfully checked generated dag for correctness\s+(\S+\.dag)',
+        plan_output,
+    )
+    if m and Path(m.group(1)).exists():
+        return m.group(1)
+
+    # Fallback: relative path from submit line
     m = re.search(
         r'File for submitting this DAG to HTCondor\s*:\s*(\S+\.dag\.condor\.sub)',
         plan_output,

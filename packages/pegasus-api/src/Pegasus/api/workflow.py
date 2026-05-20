@@ -1268,6 +1268,32 @@ class Workflow(Writable, HookMixin, ProfileMixin, MetadataMixin):
             # self._path is set by write
             self.write()
 
+        # Runtime prediction — runs automatically when
+        # pegasus.runtime.prediction.enable = true is set in properties
+        _pred_enabled = str(
+            properties.get("pegasus.runtime.prediction.enable", "false")
+        ).lower() in ("true", "1", "yes")
+        if _pred_enabled:
+            try:
+                from Pegasus.runtime_predictor import (
+                    RuntimePredictionConfig,
+                    WorkflowRuntimePredictor,
+                )
+                _pred_cfg = RuntimePredictionConfig(
+                    enabled    = True,
+                    model_path = properties.get("pegasus.runtime.prediction.model.path"),
+                    output_dir = properties.get(
+                        "pegasus.runtime.prediction.output.dir",
+                        str(dir) if dir else None,
+                    ),
+                )
+                WorkflowRuntimePredictor(_pred_cfg).predict(self)
+            except Exception as _pred_err:
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    f"Runtime prediction skipped: {_pred_err}"
+                )
+
         workflow_instance = self._client.plan(
             abstract_workflow=self._path,
             basename=basename,

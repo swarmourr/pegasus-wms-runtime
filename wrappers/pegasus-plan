@@ -1,30 +1,38 @@
 #!/usr/bin/env python3
 """
-pegasus-plan wrapper — injects runtime prediction as a native DAG job.
+pegasus-plan wrapper — adds runtime prediction jobs to the concrete DAG.
 
-Intercepts every pegasus-plan call:
-  1. Injects pegasus-runtime-predictor Job into workflow.yml (like stage-in)
-  2. Adds its TC entry for every --sites execution site with
-     condor.universe=local so it always runs on the submit machine
-  3. Delegates to the real Java planner
+The abstract workflow (workflow.yml) is NEVER modified.
+After pegasus-plan generates the .dag file, this wrapper injects
+ONE pegasus-runtime-predictor job per DAG level — same pattern as
+how Pegasus adds stage-in/cleanup to the concrete planned workflow.
 
-PATH: this file lives in <install>/pegasus-wms-runtime-src/wrappers/
-      Packages live in  <install>/pegasus-wms-runtime-src/packages/
+DAG shape (concrete, after injection):
+    [pred-L0] → [L0 user jobs]
+                       ↓
+                 [pred-L1] → [L1 user jobs]
+                                    ↓
+                              [pred-L2] → [L2 user jobs]
 """
 import os
+import re
 import sys
-import yaml
+import subprocess
 from pathlib import Path
 
-# ── Path setup ────────────────────────────────────────────────────────────────
+# ── Package path setup ────────────────────────────────────────────────────────
 _SRC_DIR = Path(__file__).resolve().parent.parent   # pegasus-wms-runtime-src/
 for _pkg in ("pegasus-api", "pegasus-common", "pegasus-python", "pegasus-worker"):
     _p = _SRC_DIR / "packages" / _pkg / "src"
     if _p.exists():
         sys.path.insert(0, str(_p))
 
+_PREDICTOR = str(_SRC_DIR / "bin" / "pegasus-runtime-predictor")
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def _real_pegasus_plan():
+
+def _real_pegasus_plan() -> str:
     pegasus_home = os.environ.get("PEGASUS_HOME")
     if pegasus_home:
         real = Path(pegasus_home) / "bin" / "pegasus-plan"
@@ -37,127 +45,168 @@ def _real_pegasus_plan():
         candidate = Path(d) / "pegasus-plan"
         if candidate.exists():
             return str(candidate)
-    raise FileNotFoundError("Cannot find real pegasus-plan. Make sure PEGASUS_HOME is set.")
+    raise FileNotFoundError("Cannot find real pegasus-plan. Set PEGASUS_HOME.")
 
-def _find_workflow_yaml(args):
+
+def _find_dag_file(plan_output: str) -> str | None:
+    """Parse pegasus-plan stdout/stderr to locate the generated .dag file."""
+    m = re.search(
+        r'File for submitting this DAG to HTCondor\s*:\s*(\S+\.dag\.condor\.sub)',
+        plan_output,
+    )
+    if m:
+        dag = m.group(1).replace(".dag.condor.sub", ".dag")
+        if Path(dag).exists():
+            return dag
+    return None
+
+
+def _find_workflow_yaml(args) -> str | None:
     for arg in args:
         if (arg.endswith(".yml") or arg.endswith(".yaml")) and Path(arg).exists():
             return arg
     return None
 
-def _parse_sites(args):
-    """Extract --sites value(s) from pegasus-plan arguments."""
-    sites = []
-    for i, arg in enumerate(args):
-        if arg in ("--sites", "-s") and i + 1 < len(args):
-            sites.extend(args[i + 1].split(","))
-        elif arg.startswith("--sites="):
-            sites.extend(arg.split("=", 1)[1].split(","))
-    return [s.strip() for s in sites if s.strip()]
 
-def _find_tc_yml(workflow_yml):
-    """Look for tc.yml next to the workflow file."""
-    tc = Path(workflow_yml).parent / "tc.yml"
-    return str(tc) if tc.exists() else None
-
-def _inject_tc_entry(tc_yml, sites, pfn):
+def _parse_dag_levels(dag_text: str):
     """
-    Add pegasus-runtime-predictor to tc.yml for every execution site
-    with condor.universe=local so it runs on the submit machine.
+    Topological sort of JOB nodes in a .dag file into levels.
+    Skips Pegasus-generated infrastructure jobs (stage-in, cleanup, create-dir).
     """
-    with open(tc_yml) as f:
-        data = yaml.safe_load(f) or {}
+    jobs = {}       # job_id -> sub_file
+    children = {}   # parent_id -> set of child_ids
 
-    data.setdefault("pegasus", "5.0")
-    data.setdefault("transformations", [])
+    for line in dag_text.splitlines():
+        line = line.strip()
+        if line.startswith("JOB "):
+            parts = line.split()
+            jobs[parts[1]] = parts[2] if len(parts) > 2 else ""
+        elif line.startswith("PARENT "):
+            parts = line.split()
+            child_start = parts.index("CHILD")
+            parents = parts[1:child_start]
+            childs  = parts[child_start + 1:]
+            for p in parents:
+                children.setdefault(p, set()).update(childs)
 
-    # Find or create the pegasus-runtime-predictor entry
-    pred_entry = next(
-        (t for t in data["transformations"] if t.get("name") == "pegasus-runtime-predictor"),
-        None,
+    # Skip Pegasus internal jobs (they contain "stage", "clean", "create_dir")
+    skip = {j for j in jobs if re.search(r"stage_|cleanup|create_dir|chmod", j, re.I)}
+    user_jobs = {j: s for j, s in jobs.items() if j not in skip}
+
+    # Build parent map for user jobs only
+    parent_map = {j: set() for j in user_jobs}
+    for p, cs in children.items():
+        for c in cs:
+            if c in user_jobs and p in user_jobs:
+                parent_map[c].add(p)
+
+    # Kahn's topological sort
+    levels, assigned, remaining = [], set(), set(user_jobs)
+    while remaining:
+        level = [j for j in remaining if parent_map.get(j, set()).issubset(assigned)]
+        if not level:
+            level = list(remaining)
+        levels.append(level)
+        assigned.update(level)
+        remaining -= set(level)
+
+    return levels
+
+
+def _create_pred_sub(dag_dir: Path, job_id: str, wf_yaml: str,
+                     output_dir: str, level_idx: int) -> str:
+    """Write an HTCondor submit file for a prediction job."""
+    sub = dag_dir / f"{job_id}.sub"
+    log = dag_dir / f"{job_id}.log"
+    out = dag_dir / f"{job_id}.out"
+    err = dag_dir / f"{job_id}.err"
+    sub.write_text(
+        f"universe       = local\n"
+        f"executable     = {sys.executable}\n"
+        f"arguments      = {_PREDICTOR} {wf_yaml} {output_dir} --level={level_idx}\n"
+        f"log            = {log}\n"
+        f"output         = {out}\n"
+        f"error          = {err}\n"
+        f"should_transfer_files = NO\n"
+        f"queue\n"
     )
-    if pred_entry is None:
-        pred_entry = {"name": "pegasus-runtime-predictor", "sites": []}
-        data["transformations"].append(pred_entry)
+    return str(sub)
 
-    existing_sites = {s["name"] for s in pred_entry.get("sites", [])}
-    for site in sites:
-        if site not in existing_sites:
-            pred_entry["sites"].append({
-                "name":    site,
-                "pfn":     pfn,
-                "type":    "installed",
-                "profiles": {
-                    # condor.universe=local = runs on submit machine,
-                    # same as stage-in/stage-out/cleanup
-                    "condor": {"universe": "local"},
-                },
-            })
 
-    with open(tc_yml, "w") as f:
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+def _inject_prediction_jobs(dag_path: str, wf_yaml: str, output_dir: str):
+    """
+    Append pegasus-runtime-predictor jobs to the concrete .dag file.
+    One job per user-job level, wired exactly like stage-in/cleanup nodes.
+    """
+    with open(dag_path) as f:
+        dag_text = f.read()
 
-# ── Prediction injection ──────────────────────────────────────────────────────
-def _inject_prediction(workflow_yml, sites):
-    try:
-        from Pegasus.api import File, Job, Namespace, Workflow
-        from Pegasus.runtime_predictor import RuntimePredictionConfig, WorkflowRuntimePredictor
+    # Skip if already injected
+    if "pegasus_runtime_pred_" in dag_text:
+        print("[pegasus-plan] Prediction jobs already in DAG — skipping.", flush=True)
+        return
 
-        with open(workflow_yml) as f:
-            raw = yaml.safe_load(f)
+    dag_dir = Path(dag_path).parent
+    levels  = _parse_dag_levels(dag_text)
+    if not levels:
+        return
 
-        # Skip if prediction jobs already injected (idempotency guard)
-        if any(j.get("name") == "pegasus-runtime-predictor"
-               for j in raw.get("jobs", [])):
-            print("[pegasus-plan] Prediction job already present — skipping injection.", flush=True)
-            return
+    job_lines = []
+    dep_lines = []
+    prev_pred = None
 
-        wf = Workflow(raw.get("name", "workflow"), infer_dependencies=False)
-        for jdata in raw.get("jobs", []):
-            job = Job(jdata.get("name", jdata.get("transformation", "unknown")),
-                      _id=jdata.get("id", ""))
-            for u in jdata.get("uses", []):
-                fi = File(u["lfn"])
-                try:
-                    if u.get("size"):
-                        fi.size = int(u["size"])
-                except (ValueError, TypeError):
-                    pass
-                if u.get("type") == "input":
-                    job.add_inputs(fi)
-                elif u.get("type") == "output":
-                    job.add_outputs(fi)
-            for k, v in jdata.get("profiles", {}).get("condor", {}).items():
-                job.add_profiles(Namespace.CONDOR, **{k: str(v)})
-            wf.add_jobs(job)
+    for lvl_idx, level_jobs in enumerate(levels):
+        pred_id  = f"pegasus_runtime_pred_L{lvl_idx}"
+        sub_file = _create_pred_sub(dag_dir, pred_id, wf_yaml, output_dir, lvl_idx)
 
-        for dep in raw.get("dependencies", []):
-            for child_id in dep.get("children", []):
-                wf.add_dependency(wf.jobs[dep["id"]], children=[wf.jobs[child_id]])
+        job_lines.append(f"JOB {pred_id} {sub_file}")
 
-        output_dir = str(Path(workflow_yml).parent / "output")
-        WorkflowRuntimePredictor(
-            RuntimePredictionConfig(enabled=True, output_dir=output_dir)
-        ).predict(wf)
-        wf.write(file=workflow_yml)
+        # pred-LN → every user job at level N  (pred runs first)
+        for jid in level_jobs:
+            dep_lines.append(f"PARENT {pred_id} CHILD {jid}")
 
-        # Add TC entry for every execution site with condor.universe=local
-        tc_yml = _find_tc_yml(workflow_yml)
-        pfn = str(_SRC_DIR / "bin" / "pegasus-runtime-predictor")
-        if tc_yml and sites:
-            _inject_tc_entry(tc_yml, sites, pfn)
-            print(f"[pegasus-plan] TC entry added for sites: {sites}", flush=True)
+        # pred-L(N-1) → pred-LN  (serial chain between levels)
+        if prev_pred:
+            dep_lines.append(f"PARENT {prev_pred} CHILD {pred_id}")
 
-        print("[pegasus-plan] Runtime prediction job injected.", flush=True)
-    except Exception as e:
-        print(f"[pegasus-plan] Runtime prediction skipped: {e}", flush=True)
+        prev_pred = pred_id
+
+    with open(dag_path, "a") as f:
+        f.write("\n# ── Runtime Prediction Jobs (injected by pegasus-plan wrapper) ──\n")
+        for line in job_lines:
+            f.write(line + "\n")
+        for line in dep_lines:
+            f.write(line + "\n")
+
+    print(
+        f"[pegasus-plan] Injected {len(levels)} runtime prediction job(s) into DAG.",
+        flush=True,
+    )
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-args  = sys.argv[1:]
-sites = _parse_sites(args)
-wf_yaml = _find_workflow_yaml(args)
-if wf_yaml:
-    _inject_prediction(wf_yaml, sites)
 
-real = _real_pegasus_plan()
-os.execv(real, [real] + args)
+args    = sys.argv[1:]
+wf_yaml = _find_workflow_yaml(args)
+real    = _real_pegasus_plan()
+
+# Run real pegasus-plan, capturing output so we can find the .dag path
+result  = subprocess.run(
+    [real] + args,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+)
+
+# Stream output to user
+print(result.stdout, end="", flush=True)
+
+if result.returncode == 0 and wf_yaml:
+    dag_path = _find_dag_file(result.stdout)
+    if dag_path:
+        output_dir = str(Path(wf_yaml).parent / "output")
+        _inject_prediction_jobs(dag_path, wf_yaml, output_dir)
+    else:
+        print("[pegasus-plan] Could not locate .dag file — prediction not injected.", flush=True)
+
+sys.exit(result.returncode)

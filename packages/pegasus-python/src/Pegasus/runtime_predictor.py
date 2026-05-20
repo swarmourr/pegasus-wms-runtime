@@ -717,38 +717,40 @@ class WorkflowRuntimePredictor:
         * Outputs ``runtime_predictions.json`` and ``runtime_predictions.csv``
           as real DAG file nodes
         """
-        try:
-            from Pegasus.api import File, Job, Namespace  # local import, no circular dep
+        import logging as _log
+        _logger = _log.getLogger(__name__)
 
-            # Find root jobs BEFORE injection (level 0 = no upstream dependencies)
-            levels = _build_dag_levels(workflow)
-            if not levels:
-                return
-            root_job_ids = [jid for jid, _ in levels[0]]
+        from Pegasus.api import File, Job, Namespace  # local import, no circular dep
 
-            # Build the native prediction job
-            pred_json = File("runtime_predictions.json")
-            pred_csv  = File("runtime_predictions.csv")
+        # Find root jobs BEFORE injection (level 0 = no upstream dependencies)
+        levels = _build_dag_levels(workflow)
+        if not levels:
+            _logger.warning("[runtime-predictor] DAG is empty — skipping job injection")
+            return
+        root_job_ids = [jid for jid, _ in levels[0]]
+        _logger.info(
+            f"[runtime-predictor] Injecting prediction job before {len(root_job_ids)} root job(s): {root_job_ids}"
+        )
 
-            pred_job = (
-                Job("pegasus-runtime-predictor")
-                .add_args("workflow.yml", output_dir)
-                .add_outputs(pred_json, pred_csv, stage_out=True, register_replica=False)
-                # Mark as Pegasus infrastructure job (auxillary = planner-generated)
-                .add_profiles(Namespace.PEGASUS, key="job.type",  value="auxillary")
-                .add_profiles(Namespace.PEGASUS, key="label",     value="runtime-prediction")
-                # Run locally — same site as stage-in/stage-out
-                .add_profiles(Namespace.PEGASUS, key="execution.site", value="local")
-            )
+        # Build the native prediction job
+        pred_json = File("runtime_predictions.json")
+        pred_csv  = File("runtime_predictions.csv")
 
-            workflow.add_jobs(pred_job)
+        pred_job = (
+            Job("pegasus-runtime-predictor")
+            .add_args("workflow.yml", output_dir)
+            .add_outputs(pred_json, pred_csv, stage_out=True, register_replica=False)
+            # Mark as Pegasus infrastructure job (auxillary = planner-generated)
+            .add_profiles(Namespace.PEGASUS, key="job.type",  value="auxillary")
+            .add_profiles(Namespace.PEGASUS, key="label",     value="runtime-prediction")
+            # Run locally — same site as stage-in/stage-out
+            .add_profiles(Namespace.PEGASUS, key="execution.site", value="local")
+        )
 
-            # Wire: prediction_job → every root user job  (same as stage-in → user jobs)
-            for root_id in root_job_ids:
-                workflow.add_dependency(pred_job, children=[workflow.jobs[root_id]])
+        workflow.add_jobs(pred_job)
+        _logger.info(f"[runtime-predictor] Added job {pred_job._id} to workflow ({len(workflow.jobs)} total jobs)")
 
-        except Exception as _e:
-            import logging as _log
-            _log.getLogger(__name__).warning(
-                f"[runtime-predictor] Could not inject DAG job: {_e}"
-            )
+        # Wire: prediction_job → every root user job  (same as stage-in → user jobs)
+        for root_id in root_job_ids:
+            workflow.add_dependency(pred_job, children=[workflow.jobs[root_id]])
+            _logger.info(f"[runtime-predictor] Dependency: {pred_job._id} → {root_id}")

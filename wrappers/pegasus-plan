@@ -106,6 +106,12 @@ def _inject_prediction(workflow_yml, sites):
         with open(workflow_yml) as f:
             raw = yaml.safe_load(f)
 
+        # Skip if prediction job already injected (idempotency guard)
+        if any(j.get("name") == "pegasus-runtime-predictor"
+               for j in raw.get("jobs", [])):
+            print("[pegasus-plan] Prediction job already present — skipping injection.", flush=True)
+            return
+
         wf = Workflow(raw.get("name", "workflow"), infer_dependencies=False)
         for jdata in raw.get("jobs", []):
             job = Job(jdata.get("name", jdata.get("transformation", "unknown")),

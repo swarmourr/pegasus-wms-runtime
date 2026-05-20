@@ -1,0 +1,174 @@
+#!/bin/bash
+
+set -e
+set -v
+
+TOPDIR=`pwd`
+
+CONFIG=`basename $1`
+DAX=blackdiamond.dax
+
+# Unique directory for this run
+RUN_ID=`/bin/date +'%Y%m%d_%H%M%S%N'`
+
+# Read a property from ${CONFIG}/test.config file
+properties ()
+{
+	eval $1=\"`grep "^[\s]*[^#]*$2\s*=" ${CONFIG}/test.config | cut -d"=" -f2 | sed -e 's/^\s*//g' -e 's/\s*$//g'`\"
+
+	local i=\$$1
+	eval local temp=$i
+
+	# If property not set or is empty, then check if default value is provided. If Yes set property to default value.
+	if [[ -z $temp && ! -z $3 ]]; then
+		eval $1=$3
+	fi
+}
+
+# Read the physical directory where the input file is located.
+properties input_file input_file
+
+if [ -z ${input_file} ]; then
+	input_file='./f.a'
+else
+	mkdir -p ${input_file}/$USER/inputs
+	input_file=${input_file}/$USER/inputs/f.a
+fi
+
+# generate the input file
+echo "This is sample input to KEG" > ${input_file}
+
+# output directory
+mkdir -p outputs
+mkdir -p staging-site
+
+export REMOTE_PEGASUS_HOME=/scitech/shared/scratch-90-days/bamboo/installs/pegasus-`pegasus-version`
+
+# build the dax generator
+if [[ "${CONFIG}" == *"sharedfs"*  ]]; then
+    PEGASUS_HOME="/usr"
+else
+    PEGASUS_HOME="$(dirname $(dirname $(which pegasus-version)))"
+fi
+PYTHONPATH=$(pegasus-config --python) ./blackdiamond.py "${PEGASUS_HOME}" ${CONFIG} > ${DAX}
+
+# figure out if we are going to use a remote PEGASUS_HOME
+# for sharedfs or not
+properties use_remote_pegasus_home use_remote_pegasus_home true
+sc_snippet=""
+if [ "$use_remote_pegasus_home" == true ]; then
+    sc_snippet="    env:
+      PEGASUS_HOME: $REMOTE_PEGASUS_HOME"
+fi
+echo "SNIPPET IS $sc_snippet"
+
+
+# create the site catalog
+cat > sites.yml << EOF
+pegasus: "5.0"
+sites:
+ -
+  name: "cartman-data"
+  arch: "x86"
+  os.type: "linux"
+  directories:
+   -
+    type: "sharedScratch"
+    path: "${TOPDIR}/staging-site/scratch"
+    fileServers:
+     -
+      operation: "all"
+      url: "scp://bamboo@bamboo.isi.edu${TOPDIR}/staging-site/scratch"
+  profiles:
+    pegasus:
+      SSH_PRIVATE_KEY: /scitech/shared/home/bamboo/.ssh/workflow_id_rsa
+
+ -
+  name: "condorpool"
+  arch: "x86_64"
+  os.type: "linux"
+  os.release: "rhel"
+  os.version: "8"
+  profiles:
+    condor:
+      universe: "vanilla"
+    pegasus:
+      style: "condor"
+ -
+  name: "sharedfs"
+  arch: "x86_64"
+  os.type: "linux"
+  os.release: "rhel"
+  os.version: "8"
+  directories:
+   -
+    type: "sharedStorage"
+    path: "/scitech/shared/scratch-90-days/testing/$USER/black-diamond-output/$RUN_ID"
+    fileServers:
+     -
+      operation: "all"
+      url: "file:///scitech/shared/scratch-90-days/$USER/storage/black-diamond-output/$RUN_ID"
+   -
+    type: "sharedScratch"
+    path: "/scitech/shared/scratch-90-days/$USER/scratch/$RUN_ID"
+    fileServers:
+     -
+      operation: "all"
+      url: "file:///scitech/shared/scratch-90-days/$USER/scratch/$RUN_ID"
+  profiles:
+$sc_snippet
+    pegasus:
+      style: "condor"
+ -
+  name: "local"
+  arch: "x86_64"
+  os.type: "linux"
+  os.release: "rhel"
+  os.version: "8"
+  directories:
+   -
+    type: "sharedStorage"
+    path: "$TOPDIR/outputs"
+    fileServers:
+     -
+      operation: "all"
+      url: "file://$TOPDIR/outputs"
+   -
+    type: "sharedScratch"
+    path: "$TOPDIR/work"
+    fileServers:
+     -
+      operation: "all"
+      url: "file://$TOPDIR/work"
+  profiles:
+    pegasus:
+      clusters.num: "1"
+EOF
+
+# plan and submit the workflow
+properties execution_site execution_site
+properties staging_site staging_site
+properties output_site output_site
+properties planner_args planner_args
+properties clean_up clean_up 'leaf'
+
+
+if [ -e ${TOPDIR}/pegasusrc ]; then
+    cat ${TOPDIR}/pegasusrc >> ${CONFIG}/pegasusrc
+else
+    exit 1
+fi
+
+set -x
+
+pegasus-plan \
+    --conf ${CONFIG}/pegasusrc \
+    --sites $execution_site \
+    --staging-site $staging_site \
+    --output-sites $output_site \
+    --dir work/submit \
+    --cleanup $clean_up \
+    --submit ${planner_args} \
+    ${DAX}
+
+set +x

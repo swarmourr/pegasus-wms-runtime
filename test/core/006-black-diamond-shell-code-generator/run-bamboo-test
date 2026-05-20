@@ -1,0 +1,67 @@
+#!/bin/bash
+
+set -e
+set -v
+
+
+TOPDIR=`pwd`
+
+# unique directory for this run
+RUN_ID=`/bin/date +'%F_%H%M%S'`
+RUN_DIR=`pwd`/work/submit/$RUN_ID
+
+# generate the input file
+echo "This is sample input to KEG" > f.a
+
+# output directory
+mkdir -p outputs
+
+# build the dax generator
+CLASSPATH=.:$(pegasus-config --classpath) javac BlackDiamondDAX.java
+
+# generate the dax
+PEGASUS_HOME="$(dirname $(dirname $(which pegasus-version)))"
+CLASSPATH=.:$(pegasus-config --classpath) java BlackDiamondDAX "${PEGASUS_HOME}" blackdiamond.dax
+
+# create the site catalog
+cat > sites.yml <<EOF
+pegasus: "5.0"
+sites:
+ -
+  name: "local"
+  arch: "x86_64"
+  os.type: "linux"
+  os.release: "rhel"
+  os.version: "7"
+  directories:
+   -
+    type: "sharedStorage"
+    path: "$TOPDIR/outputs"
+    fileServers:
+     -
+      operation: "all"
+      url: "file://$TOPDIR/outputs"
+   -
+    type: "sharedScratch"
+    path: "$TOPDIR/work"
+    fileServers:
+     -
+      operation: "all"
+      url: "file://$TOPDIR/work"
+  profiles:
+    env:
+      SSH_PRIVATE_KEY: "/scitech/shared/home/bamboo/.ssh/workflow_id_rsa"
+      PEGASUS_HOME: "${PEGASUS_HOME}"
+      GLOBUS_LOCATION: "/ccg/software/globus/default"
+EOF
+
+# plan and submit the  workflow
+pegasus-plan \
+    -Dpegasus.code.generator=Shell \
+    --conf pegasusrc \
+    --sites local \
+    --dir work/submit \
+    --relative-submit-dir ${RUN_ID} \
+    --output-sites local \
+    --cleanup leaf \
+    --submit blackdiamond.dax | tee plan.out

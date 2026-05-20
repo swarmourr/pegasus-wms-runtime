@@ -1,0 +1,43 @@
+#!/bin/bash
+
+set -e
+set -v
+
+VERSION=$1
+
+# make sure we are in a source dir
+if [ ! -e build.xml ]; then
+    echo "This does not look a like a source directory. Exiting..."
+    exit 1
+fi
+
+TOP_DIR=$PWD
+
+
+# create the dist package
+for pkg in `find packages -maxdepth 1 -type d`; do
+    if [ ! -f ${pkg}/setup.py ]; then
+        continue
+    fi
+
+    rm -rf ${pkg}/dist
+
+    ( cd ${pkg} && /usr/bin/env python3 setup.py sdist)
+
+    # python is now normalizing the version (see PEP 440)
+    cd ${pkg}/dist
+
+    SDIST=$(basename `ls *.tar.gz` .tar.gz)
+    NORM_VERSION=`ls *.tar.gz | sed 's/pegasus-wms.*-//' | sed 's/\.tar\.gz//'`
+    echo "Normalized verison is $NORM_VERSION"
+
+    tar xzf $SDIST.tar.gz
+    sed -i.bak -e s/version=read_version\(\)/version=\"${VERSION}\"/g ${SDIST}/setup.py
+    rm ${SDIST}/setup.py.bak
+
+    # create the final tarball
+    tar czf $TOP_DIR/dist/pegasus-python-source-${VERSION}.tar.gz ${SDIST}
+    rm -rf pegasus-wms-${NORM_VERSION}*
+
+    cd $TOP_DIR
+done

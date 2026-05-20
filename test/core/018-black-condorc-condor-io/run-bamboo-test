@@ -1,0 +1,7 @@
+#!/bin/bash
+
+set -e
+set -v
+
+echo "Running blackdiamond.py"
+python3 blackdiamond.py

@@ -1,0 +1,103 @@
+#!/bin/bash
+
+set -e
+set -v
+
+
+if [ X${testdir} = "X" ]; then
+    testdir=`dirname  $0`
+    export testdir
+fi
+
+TOPDIR=`pwd`
+
+# generate the input file
+echo "This is sample input to KEG" >f.a
+
+# output directory
+mkdir -p outputs
+
+# build the dax generator
+export CLASSPATH=$testdir:$(pegasus-config --classpath)
+javac $testdir/BlackDiamondDAX.java
+
+# generate the dax
+java BlackDiamondDAX /usr blackdiamond.dax
+
+# create the site catalog
+cat > sites.yml <<EOF
+pegasus: "5.0"
+sites:
+ -
+  name: "condorpool"
+  arch: "x86_64"
+  os.type: "linux"
+  directories:
+   -
+    type: "sharedStorage"
+    path: "/scitech/shared/scratch-90-days/bamboo/outputs"
+    fileServers:
+     -
+      operation: "all"
+      url: "scp://bamboo@bamboo.isi.edu/scitech/shared/scratch-90-days/bamboo/outputs"
+   -
+    type: "sharedScratch"
+    path: "/scitech/shared/scratch-90-days/bamboo/scratch"
+    fileServers:
+     -
+      operation: "all"
+      url: "scp://bamboo@bamboo.isi.edu/scitech/shared/scratch-90-days/bamboo/scratch"
+  profiles:
+    env:
+      PEGASUS_HOME: "/usr"
+    condor:
+      universe: "vanilla"
+    pegasus:
+      SSH_PRIVATE_KEY: /scitech/shared/home/bamboo/.ssh/workflow_id_rsa
+      style: "condor"
+ -
+  name: "local"
+  arch: "x86_64"
+  os.type: "linux"
+  directories:
+   -
+    type: "sharedStorage"
+    path: "$TOPDIR/outputs"
+    fileServers:
+     -
+      operation: "all"
+      url: "file://$TOPDIR/outputs"
+   -
+    type: "sharedScratch"
+    path: "$TOPDIR/work"
+    fileServers:
+     -
+      operation: "all"
+      url: "file://$TOPDIR/work"
+  profiles:
+    pegasus:
+      clusters.num: "1"
+EOF
+
+# plan and submit the  workflow
+pegasus-plan \
+    --conf $testdir/pegasusrc \
+    --sites condorpool \
+    --dir work \
+    --output-sites local \
+    --cluster label \
+    blackdiamond.dax  | tee $TOPDIR/plan.out
+
+STATUS=$?
+if [ $STATUS != 0 ]; then
+   echo "Workflow submission failed"
+   exit $STATUS
+fi
+
+lines=`wc -l plan.out | sed 's/[ ]*\([0-9]*\) plan.out/\1/'`
+echo "Number of lines in planner output $lines"
+
+if [ "$lines" -gt "28" ]; then
+    echo "ERROR: planner output is too verbose $lines. Check plan.out file for extra log messages"
+    exit 1
+fi

@@ -1,0 +1,7 @@
+pegasus.dir.useTimestamp=true
+
+pegasus.condor.logs.symlink = false
+
+pegasus.clusterer.preference = Runtime
+pegasus.data.configuration = condorio
+pegasus.catalog.transformation.mapper = Staged

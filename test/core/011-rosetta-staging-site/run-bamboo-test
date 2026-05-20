@@ -1,0 +1,130 @@
+#!/bin/bash
+
+set -e
+
+TOP_DIR=`pwd`
+# determine TEST_NAME to setup site catalog
+if [ X${testdir} = "X" ]; then
+    testdir=`dirname  $0`
+fi
+TESTDIR=$(cd $testdir && pwd)
+TEST_NAME=`basename $TESTDIR`
+export TEST_NAME
+
+# limit the memory - this is to the test the common.sh ulimit check
+ulimit -m 512000
+
+# download rosetta binary - this is to save space in the Pegasus distribution
+if [ ! -e rosetta.exe ]; then
+   wget -q -O rosetta.exe http://pegasus.isi.edu/wms/example-workflows/rosetta/fake-rosetta.exe
+   chmod 755 rosetta.exe
+fi
+
+# do we have the required minirosetta_database?
+if [ ! -e minirosetta_database ]; then
+   wget -q http://pegasus.isi.edu/wms/example-workflows/rosetta/minirosetta_database.tar.gz
+   tar xzf minirosetta_database.tar.gz
+   rm minirosetta_database.tar.gz
+fi
+
+# what about the required pdbs?
+if [ ! -e pdbs ]; then
+   wget -q http://pegasus.isi.edu/wms/example-workflows/rosetta/pdbs.tar.gz
+   tar xzf pdbs.tar.gz
+   rm pdbs.tar.gz
+fi
+
+# figure out where Pegasus is installed
+export PEGASUS_BIN_DIR=`pegasus-config --bin`
+if [ "x$PEGASUS_BIN_DIR" = "x" ]; then
+    echo "Please make sure pegasus-plan is in your path"
+    exit 1
+fi
+
+# build the dax generator
+CLASSPATH=.:$(pegasus-config --classpath) javac RosettaDAX.java
+
+# generate the dax
+CLASSPATH=.:$(pegasus-config --classpath) java RosettaDAX dax.yml
+
+# site catalog
+cat > sites.yml <<EOF
+pegasus: "5.0"
+sites:
+ -
+  name: "eclair"
+  arch: "x86_64"
+  os.type: "linux"
+  grids:
+   -
+    type: "batch"
+    contact: "rynge@eclair-sub-01.isi.edu:22"
+    scheduler: "slurm"
+    jobtype: "compute"
+  profiles:
+     pegasus:
+      # SSH is the style to use for Bosco SSH submits.
+      style: ssh
+      #
+      queue: scavenge
+      project: scavenge
+      runtime: 1800
+      glite.arguments: --cpus-per-task=1
+      memory: 2048
+      # Works around bug in the HTCondor GAHP, that does not
+      # set the remote directory
+      change.dir: 'true'
+      # the key to use for scp transfers
+      SSH_PRIVATE_KEY: /scitech/shared/home/bamboo/.ssh/workflow_id_rsa
+     env:
+      TMPDIR: "/scratch"
+ -
+  name: "local"
+  arch: "x86_64"
+  os.type: "linux"
+  directories:
+   -
+    type: "sharedStorage"
+    path: "$TOP_DIR/outputs"
+    fileServers:
+     -
+      operation: "all"
+      url: "scp://bamboo@bamboo.isi.edu:$TOP_DIR/outputs"
+   -
+    type: "sharedScratch"
+    path: "$TOP_DIR/scratch"
+    fileServers:
+     -
+      operation: "all"
+      url: "scp://bamboo@bamboo.isi.edu:$TOP_DIR/scratch"
+  profiles:
+    env:
+      PEGASUS_BIN_DIR: "$PEGASUS_BIN_DIR"
+    pegasus:
+      SSH_PRIVATE_KEY: /scitech/shared/home/bamboo/.ssh/workflow_id_rsa
+ -
+  name: "staging"
+  arch: "x86_64"
+  os.type: "linux"
+  directories:
+   -
+    type: "sharedScratch"
+    path: "/webdav/scitech/shared/scratch-90-days/${TEST_NAME}"
+    fileServers:
+     -
+      operation: "all"
+      url: "webdavs://workflow.isi.edu/webdav/scitech/shared/scratch-90-days/${TEST_NAME}"
+EOF
+
+echo
+echo
+echo "Planning and submitting the workflow..."
+pegasus-plan \
+    --conf pegasusrc \
+    --dir work \
+    --sites eclair \
+    --staging-site staging \
+    --output-sites local \
+    --submit dax.yml | tee $TOP_DIR/plan.out
+
+

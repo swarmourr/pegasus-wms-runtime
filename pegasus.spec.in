@@ -1,0 +1,118 @@
+Name:           pegasus
+Version:        @PEGASUS_VERSION@
+Release:        1%{?dist}
+Summary:        Workflow management system for HTCondor, grids, and clouds
+Group:          Applications/System
+License:        ASL 2.0
+URL:            http://pegasus.isi.edu/
+Packager:       Pegasus Development Team <pegasus-support@isi.edu>
+
+Source:         pegasus-%{version}.tar.gz
+
+BuildRequires:  gcc, gcc-c++, javapackages-tools, make, openssl-devel, ant, python3-devel, python3-pip, python3-setuptools
+Requires:       which, python3, condor >= 10.0, graphviz, %{?systemd_requires}
+
+%global debug_package %{nil}
+
+%if 0%{?rhel} == 8
+BuildRequires:  java-17-openjdk-devel, python3-setuptools_scm
+Requires:       java-17-openjdk-headless, python3-cryptography, python3-PyYAML, python3-GitPython, python3-dataclasses
+%endif
+
+%if 0%{?rhel} == 9
+BuildRequires:  ant-apache-regexp, java-21-openjdk-devel
+Requires:       java-21-openjdk-headless, python3-cryptography, python3-PyYAML, python3-GitPython
+%endif
+
+%if 0%{?rhel} == 10
+BuildRequires:  ant-apache-regexp, java-21-openjdk-devel
+Requires:       java-21-openjdk-headless, python3-cryptography, python3-PyYAML, python3-GitPython
+%endif
+
+%define sourcedir %{name}-%{_version}
+
+# Disables the automatic dependency generator, which will include
+# Python deps on packages we include inside our package
+%{?python_disable_dependency_generator}
+
+# Turn off automatic python bytecompilation
+# Will bytecompile manually with Python 2 and 3 separately
+%undefine __brp_python_bytecompile
+
+%description
+The Pegasus project encompasses a set of technologies that
+help workflow-based applications execute in a number of
+different environments including desktops, campus clusters,
+grids, and now clouds. Scientific workflows allow users to
+easily express multi-step computations. Once an application
+is formalized as a workflow the Pegasus Workflow Management
+Service can map it onto available compute resources and
+execute the steps in appropriate order.
+
+
+%prep
+%setup -q -n %{sourcedir}
+
+%build
+ant dist-release
+
+# strip executables
+strip dist/pegasus-%{_version}/bin/pegasus-cluster
+strip dist/pegasus-%{_version}/bin/pegasus-kickstart
+strip dist/pegasus-%{_version}/bin/pegasus-keg
+
+%install
+
+mkdir -p %{buildroot}/%{_sysconfdir}/%{name}
+mkdir -p %{buildroot}/%{_bindir}
+mkdir -p %{buildroot}/%{_datadir}
+mkdir -p %{buildroot}/%{_unitdir}
+
+cp -aR dist/pegasus-%{_version}/etc/* %{buildroot}/%{_sysconfdir}/%{name}/
+cp -aR dist/pegasus-%{_version}/bin/* %{buildroot}/%{_bindir}/
+cp -aR dist/pegasus-%{_version}/lib* %{buildroot}/usr/
+cp -aR dist/pegasus-%{_version}/share/* %{buildroot}/%{_datadir}/
+
+install -m 0644 dist/%{name}-%{_version}/share/pegasus/systemd-unit/pegasus-service.service %{buildroot}/%{_unitdir}/
+
+# rm unwanted files
+rm -f  %{buildroot}/%{_bindir}/keg.condor
+rm -f  %{buildroot}/%{_datadir}/%{name}/java/COPYING.*
+rm -f  %{buildroot}/%{_datadir}/%{name}/java/EXCEPTIONS.*
+rm -f  %{buildroot}/%{_datadir}/%{name}/java/LICENSE.*
+rm -f  %{buildroot}/%{_datadir}/%{name}/java/NOTICE.*
+rm -rf %{buildroot}/%{_datadir}/%{name}/systemd-unit
+
+%pre
+# Handle previous install where /usr/lib64/pegasus/python was a directory
+if [ -d /usr/lib64/pegasus/python ] && [ ! -L /usr/lib64/pegasus/python ]; then
+    echo "Removing old /usr/lib64/pegasus/python directory to allow symlink install"
+    rm -rf /usr/lib64/pegasus/python
+fi
+
+%files
+%defattr(-,root,root,-)
+%config(noreplace) %{_sysconfdir}/%{name}/
+%{_bindir}/*
+%{_libdir}/pegasus
+%{_libdir}/python*
+%{_datadir}/%{name}
+%{_unitdir}/pegasus-service.service
+
+%post
+# Enable the systemd user service (doesn't work in containers)
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+%preun
+# Disable the service before uninstalling (doesn't work in containers)
+systemctl stop pegasus-service.service >/dev/null 2>&1 || true
+systemctl disable pegasus-service.service >/dev/null 2>&1 || true
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+%changelog
+* @DATE@ Pegasus Development Team <pegasus-support@isi.edu> @PEGASUS_VERSION@
+- @PEGASUS_VERSION@ automatic build
+
+* Mon Dec 02 2013 Pegasus Development Team <pegasus-support@isi.edu> 4.3.2cvs
+- Relaxed the "java" requirements in order for the package to work on plan
+  CentOS machines

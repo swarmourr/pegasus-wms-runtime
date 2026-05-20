@@ -1,0 +1,49 @@
+#!/bin/bash
+
+
+TOPDIR=`pwd`
+
+function run_test
+{
+    cmd=$1
+
+    echo "Test command: $cmd"
+    
+    $cmd
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "ERROR: Command failed with exit code $rc"
+        exit 1
+    fi
+}
+
+if [ -d "/ccg/software/globus/default" ]; then
+	export GLOBUS_LOCATION=/ccg/software/globus/default
+	. $GLOBUS_LOCATION/etc/globus-user-env.sh
+fi
+
+TEMPNAME=$(mktemp pegasus-gridftp-test-XXXXX)
+
+# Create directories
+run_test "pegasus-gridftp mkdir gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}"
+run_test "pegasus-gridftp mkdir gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}/a"
+run_test "pegasus-gridftp mkdir -p gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}/b/c"
+
+run_test "globus-url-copy file://${PWD}/$TEMPNAME gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}/a/1.dat"
+run_test "globus-url-copy file://${PWD}/$TEMPNAME gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}/b/c/2.dat"
+run_test "globus-url-copy file://${PWD}/$TEMPNAME gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}/b/c/3.dat"
+
+run_test "pegasus-gridftp ls gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}/b/c"
+run_test "pegasus-gridftp ls -a gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}/b/c"
+run_test "pegasus-gridftp ls -l gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}/b/c"
+
+run_test "pegasus-gridftp rm gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}/b/c/2.dat"
+run_test "pegasus-gridftp rm -r gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}/b"
+run_test "pegasus-gridftp rm -f gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}/b"
+
+run_test "pegasus-gridftp rm -r -f gsiftp://bamboo.isi.edu/tmp/${TEMPNAME}"
+
+rm -f pegasus-gridftp-test-*
+
+exit 0
+

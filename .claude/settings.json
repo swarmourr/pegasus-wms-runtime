@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(wc:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(tox:*)",
+      "Bash(pytest:*)",
+      "Bash(autoflake:*)",
+      "Bash(pyupgrade:*)",
+      "Bash(isort:*)",
+      "Bash(black:*)",
+      "Bash(flake8:*)",
+      "Bash(ruff:*)",
+      "Bash(mypy:*)",
+      "Bash(ant:*)"
+    ]
+  },
+  "extraKnownMarketplaces": {
+    "scitech": {
+      "source": {
+        "source": "github",
+        "repo": "pegasus-isi/claude-plugin-marketplace"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "pegasus-dev@scitech": true
+  }
+}

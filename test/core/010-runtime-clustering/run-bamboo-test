@@ -1,0 +1,14 @@
+#!/bin/bash
+
+set -e
+
+CONFIG=`basename $1`
+
+if [[ "${CONFIG}" == *"-sharedfs"*  ]]; then
+    PEGASUS_KEG="/usr/bin/pegasus-keg"
+else
+    PEGASUS_KEG=`which pegasus-keg`
+fi
+
+echo "Running cluster.py"
+PYTHONPATH=$(pegasus-config --python) python3 cluster.py "${PEGASUS_KEG}" $CONFIG

@@ -1,0 +1,24 @@
+#!/bin/bash
+
+set -e
+
+echo "Running blackdiamond.py"
+PYTHONPATH=$(pegasus-config --python) python3 blackdiamond.py
+
+SUBMIT_DIR=`cat submit_dir`
+
+echo "SUBMIT_DIR is $SUBMIT_DIR"
+
+# check in the submit directory to make sure that noop job exists
+set +e
+ls $SUBMIT_DIR/*sub | grep -v noop_ | grep -v condor.sub
+EC=$?
+set -e
+
+if [ $EC -eq 0 ]; then
+    echo "ERROR: Test Failed - Submit directory contains jobs other than noop job"
+    exit 1
+fi
+
+#submit the workflow
+pegasus-run $SUBMIT_DIR

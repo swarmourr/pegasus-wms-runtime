@@ -1,0 +1,96 @@
+#!/bin/bash
+
+set -e
+set -v
+
+
+if [ X${testdir} = "X" ]; then
+    testdir=`dirname  $0`
+    export testdir
+fi
+
+TOPDIR=`pwd`
+
+# unique part of shared directory paths to make sure we do not conflict with
+# other instances of similar tests
+UUID=`uuidgen`
+
+# generate the input file
+echo "This is sample input to KEG" >f.a
+
+# output directory
+mkdir -p outputs
+
+# build the dax generator
+export CLASSPATH=$testdir:$(pegasus-config --classpath)
+javac $testdir/BlackDiamondDAX.java
+
+# generate the dax
+java BlackDiamondDAX "$(dirname $(dirname $(which pegasus-version)))" blackdiamond.dax
+
+# create the site catalog
+cat > sites.yml <<EOF
+pegasus: "5.0"
+sites:
+ -
+  name: "condorpool"
+  arch: "x86_64"
+  os.type: "linux"
+  directories:
+   -
+    type: "sharedStorage"
+    path: "/scitech/shared/scratch-90-days/bamboo/$UUID/outputs"
+    fileServers:
+     -
+      operation: "all"
+      url: "webdavs://workflow.isi.edu/webdav/scitech/shared/scratch-90-days/bamboo/$UUID/outputs"
+   -
+    type: "sharedScratch"
+    path: "/scitech/shared/scratch-90-days/bamboo/$UUID/scratch"
+    fileServers:
+     -
+      operation: "all"
+      url: "webdavs://workflow.isi.edu/webdav/scitech/shared/scratch-90-days/bamboo/$UUID/scratch"
+  profiles:
+    env:
+      PEGASUS_HOME: "/usr"
+    condor:
+      universe: "vanilla"
+    pegasus:
+      clusters.num: "1"
+      style: "condor"
+ -
+  name: "local"
+  arch: "x86_64"
+  os.type: "linux"
+  directories:
+   -
+    type: "sharedStorage"
+    path: "$TOPDIR/outputs"
+    fileServers:
+     -
+      operation: "all"
+      url: "file://$TOPDIR/outputs"
+   -
+    type: "sharedScratch"
+    path: "$TOPDIR/work"
+    fileServers:
+     -
+      operation: "all"
+      url: "file://$TOPDIR/work"
+  profiles:
+    pegasus:
+      clusters.num: "1"
+EOF
+
+# plan and submit the  workflow
+pegasus-plan \
+    --conf $testdir/pegasusrc \
+    --sites condorpool \
+    --dir work/dags \
+    --output-sites local \
+    --cluster label,horizontal \
+    -vvvv \
+    --submit \
+    blackdiamond.dax \
+    | tee plan.out

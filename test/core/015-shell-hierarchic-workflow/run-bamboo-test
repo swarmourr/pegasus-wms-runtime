@@ -1,0 +1,76 @@
+#!/bin/bash
+
+set -e
+set -v
+
+TOPDIR=`pwd`
+DAX=main.dax
+
+# Unique directory for this run
+RUN_ID=`/bin/date +'%Y%m%d_%H%M%S%N'`
+RUN_DIR=`pwd`/work/submit/$RUN_ID
+
+# create the site catalog
+cat > sites.yml <<EOF
+pegasus: "5.0"
+sites:
+ -
+  name: "local"
+  arch: "x86_64"
+  os.type: "linux"
+  os.release: "rhel"
+  os.version: "7"
+  directories:
+   -
+    type: "sharedScratch"
+    path: "$TOPDIR/work"
+    fileServers:
+     -
+      operation: "all"
+      url: "$TOPDIR/work"
+   -
+    type: "sharedStorage"
+    path: "$TOPDIR/work"
+    fileServers:
+     -
+      operation: "all"
+      url: "$TOPDIR/work"
+  grids:
+   -
+    type: "gt5"
+    contact: "localhost/jobmanager-fork"
+    scheduler: "fork"
+    jobtype: "compute"
+   -
+    type: "gt5"
+    contact: "localhost/jobmanager-fork"
+    scheduler: "fork"
+    jobtype: "auxillary"
+EOF
+
+cat > $DAX <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<adag xmlns="http://pegasus.isi.edu/schema/DAX" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://pegasus.isi.edu/schema/DAX http://pegasus.isi.edu/schema/dax-3.3.xsd" version="3.3" name="main" index="0" count="1">
+   <file name="dax">
+      <pfn url="file://$TOPDIR/inner.dax" site="local"/>
+   </file>
+   <dax id="daxid" file="dax">
+      <argument>-vvv</argument>
+   </dax>
+</adag>
+EOF
+
+set -x
+
+pegasus-plan \
+    -Dpegasus.code.generator=Shell \
+    --conf pegasusrc \
+    --sites local \
+    --output-sites local \
+    --dir work/submit \
+    --relative-submit-dir ${RUN_ID} \
+    --cleanup leaf \
+    --submit \
+    ${DAX} 
+
+set +x

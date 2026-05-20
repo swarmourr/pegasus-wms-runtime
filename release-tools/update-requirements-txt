@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# This script generates a requirements.txt file for the pegasus-wms packages
+# specific to the supported Python versions. It ignores packages that are to
+# be installed externally, like PyYAML, GitPython, and cryptography.
+
+set -e
+
+DIR=$(dirname $(dirname $0))
+
+PACKAGES=""
+for i in $(echo worker python api common); do
+    PACKAGES="packages/pegasus-${i} ${PACKAGES}"
+done
+
+rm -f $DIR/src/requirements.txt
+for i in {6..14}; do
+    echo "# ------- Python 3.$i -------" | tee -a src/requirements.txt
+
+    pip3.$i download -d p3${i} ${PACKAGES}
+
+    ls -1 p3${i} | sort | grep -iv pegasus_wms | \
+        grep -Eiv '(cryptography|cffi|pycparser)' | \
+        grep -Eiv '(gitpython|gitdb|smmap|typing-extensions)' | \
+        grep -iv pyyaml | \
+        sed -E "s/^([^-]*)-([^-]*)[-.].*/\1==\2;python_version=='3.$i'/g" | \
+        sed -E "s/\.tar(\.gz)?//g" >> $DIR/src/requirements.txt
+
+    rm -rf p3${i}
+done

@@ -1,0 +1,22 @@
+#!/bin/bash
+set -e
+
+echo "Running blackdiamond.py"
+PYTHONPATH=$(pegasus-config --python) python3 blackdiamond.py
+
+SUBMIT_DIR=`cat submit_dir`
+
+# account for deep submit directory structure
+cd $SUBMIT_DIR/00/00
+
+# PM-1192 make sure the env variable PEGASUS_LITE_ENV_SOURCE is set
+for sub in ` ls *sub | grep -E "analyze|findrange|preprocess"`; do
+    echo "Searching in file $sub"
+    pegasus_lite_env_source_set=`(grep environment $sub | grep PEGASUS_LITE_ENV_SOURCE) 2>/dev/null || /bin/true`
+    if [ "x$pegasus_lite_env_source_set" == "x" ]; then
+        echo "ERROR: PEGASUS_LITE_ENV_SOURCE not set in environment for $sub"
+        exit 1
+    fi
+done
+
+pegasus-run $SUBMIT_DIR

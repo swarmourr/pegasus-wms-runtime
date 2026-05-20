@@ -1,0 +1,11 @@
+#!/bin/bash
+
+set -e
+
+echo "Generating sleep workflow"
+# writes the file "inner_sleep_workflow.yml" which is referenced in
+# workflow.py
+PYTHONPATH=$(pegasus-config --python) python3 generate_inner_sleep_workflow.py
+
+echo "Running workflow.py"
+PYTHONPATH=$(pegasus-config --python) python3 workflow.py

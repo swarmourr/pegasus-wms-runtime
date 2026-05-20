@@ -1,0 +1,69 @@
+#!/bin/bash
+
+
+function update_status
+{
+   STATUS=$(pegasus-status -j $RUNDIR | jq -r '.dags.root.state')
+   SUMMARY=$(pegasus-status --noqueue $RUNDIR 2>&1)
+}
+
+
+function show_state
+{
+    OUT="# STATUS is $STATUS"
+    if [ "x$STATUS" = "xRunning" -a "x$SUMMARY" != "x" ]; then
+        OUT="$OUT - $SUMMARY"
+    fi
+
+    if [ "x$OLD_OUT" = "x$OUT" ]; then
+        return
+    fi
+
+    OLD_OUT="$OUT"
+    echo "$OUT"
+}
+
+
+RUNDIR=$(pwd)
+echo "RUNDIR is $RUNDIR"
+
+if [ ! -e braindump.yml ]; then
+    echo "braindump.yml was not found in this directory. Planner probably failed!" 1>&2
+    exit 1
+fi
+
+# minutes
+TIMEOUT=180
+
+START_TS=`date +'%s'`
+MAX_TS=`echo "$START_TS + $TIMEOUT * 60" | bc`
+
+sleep 30s
+update_status
+show_state
+
+while [ "$STATUS" = "Running" -o "$STATUS" = "" -o "$STATUS" = "Unknown"  ] ; do
+    NOW=`date +'%s'`
+    if [ $NOW -gt $MAX_TS ]; then
+        echo "Reached TIMEOUT of $TIMEOUT minutes. Calling pegasus-remove" 1>&2
+        pegasus-remove $RUNDIR
+        STATUS=TIMEOUT
+        sleep 1m
+        break;
+    fi
+    sleep 1m
+    update_status
+    show_state
+done
+
+# give monitord some time to finish
+sleep 1m
+
+if [ "$STATUS" = "Success" ]; then
+    echo "*** Workflow finished succesfully ***"
+    exit 0
+else
+    echo "*** Workflow failed ***" 1>&1
+    exit 1
+fi
+

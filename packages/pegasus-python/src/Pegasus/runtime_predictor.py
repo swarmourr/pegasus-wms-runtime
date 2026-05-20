@@ -1,0 +1,700 @@
+"""
+PegasusOracle — Embedded Workflow Runtime Predictor
+
+Loads a trained PegasusOracle model (.pkl) and predicts runtimes for ALL
+jobs in a workflow in a single batch pass — no external API server required.
+
+Output written to the workflow output directory:
+  runtime_predictions.csv   — one row per job
+  runtime_predictions.json  — same data + summary (status counts, slot info)
+
+Architecture matches pegasus_oracle.py exactly so the same .pkl file is portable.
+"""
+
+import json
+import math
+import os
+import pickle
+import re
+import subprocess
+import warnings
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Union
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# Default model location: <package>/models/pegasus_oracle_model.pkl
+# Drop the trained .pkl there and leave model_path unset — it is found automatically.
+_MODELS_DIR    = Path(__file__).parent / "models"
+_DEFAULT_MODEL = _MODELS_DIR / "pegasus_oracle_model.pkl"
+
+
+# ─────────────────────────────────────────────
+# 0. CONFIGURATION
+# ─────────────────────────────────────────────
+
+@dataclass
+class RuntimePredictionConfig:
+    """
+    Configuration for the workflow-level runtime predictor.
+
+    All fields are optional — unset values fall back to the model's own
+    defaults or to condor_status discovery.
+
+    Can be built manually or loaded from Pegasus properties::
+
+        cfg = RuntimePredictionConfig.from_properties(props)
+
+    Pegasus property keys
+    ---------------------
+    pegasus.runtime.prediction.enable          : "true" / "false"
+    pegasus.runtime.prediction.model.path      : /path/to/pegasus_oracle_model.pkl
+    pegasus.runtime.prediction.output.dir      : /path/to/output/dir
+    pegasus.runtime.prediction.sparse.threshold: integer  (default: model value)
+    pegasus.runtime.prediction.interval.low    : float 0–1 (default: 0.05)
+    pegasus.runtime.prediction.interval.high   : float 0–1 (default: 0.95)
+    pegasus.runtime.prediction.slot.hostname   : override condor_status hostname
+    pegasus.runtime.prediction.slot.cpu.count  : override cpu count
+    pegasus.runtime.prediction.slot.cpu.speed  : override cpu speed (MHz)
+    pegasus.runtime.prediction.slot.ram        : override RAM (kB)
+    """
+
+    # core
+    enabled:          bool            = True
+    model_path:       Optional[str]   = None
+    output_dir:       Optional[str]   = None
+
+    # model overrides (None = use value from loaded .pkl)
+    sparse_threshold: Optional[int]   = None
+    q_lo:             Optional[float] = None   # e.g. 0.05
+    q_hi:             Optional[float] = None   # e.g. 0.95
+
+    # condor slot overrides (None = query condor_status)
+    slot_hostname:    Optional[str]   = None
+    slot_cpu_count:   Optional[int]   = None
+    slot_cpu_speed:   Optional[float] = None   # MHz
+    slot_ram:         Optional[float] = None   # kB
+
+    @classmethod
+    def from_properties(cls, props) -> "RuntimePredictionConfig":
+        """
+        Build a config from a Pegasus :py:class:`~Pegasus.api.properties.Properties`
+        object or any dict-like mapping of pegasus property keys to values.
+
+        :param props: Properties object or dict with pegasus property keys
+        :return: RuntimePredictionConfig
+        """
+        def _get(key, default=None):
+            try:
+                return props[key]
+            except (KeyError, TypeError):
+                return default
+
+        def _float(key):
+            v = _get(key)
+            return float(v) if v is not None else None
+
+        def _int(key):
+            v = _get(key)
+            return int(v) if v is not None else None
+
+        def _bool(key, default=True):
+            v = _get(key)
+            if v is None:
+                return default
+            return str(v).lower() in ("true", "1", "yes")
+
+        return cls(
+            enabled          = _bool("pegasus.runtime.prediction.enable"),
+            model_path       = _get("pegasus.runtime.prediction.model.path"),
+            output_dir       = _get("pegasus.runtime.prediction.output.dir"),
+            sparse_threshold = _int("pegasus.runtime.prediction.sparse.threshold"),
+            q_lo             = _float("pegasus.runtime.prediction.interval.low"),
+            q_hi             = _float("pegasus.runtime.prediction.interval.high"),
+            slot_hostname    = _get("pegasus.runtime.prediction.slot.hostname"),
+            slot_cpu_count   = _int("pegasus.runtime.prediction.slot.cpu.count"),
+            slot_cpu_speed   = _float("pegasus.runtime.prediction.slot.cpu.speed"),
+            slot_ram         = _float("pegasus.runtime.prediction.slot.ram"),
+        )
+
+
+# ─────────────────────────────────────────────
+# 1. NEURAL ARCHITECTURE  (must match pegasus_oracle.py)
+# ─────────────────────────────────────────────
+
+try:
+    import torch
+    import torch.nn as nn
+
+    class Mish(nn.Module):
+        def forward(self, x):
+            return x * torch.tanh(nn.functional.softplus(x))
+
+    class ResBlock(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(dim, dim), nn.LayerNorm(dim), Mish(),
+                nn.Linear(dim, dim), nn.LayerNorm(dim),
+            )
+        def forward(self, x): return x + self.net(x)
+
+    class PegasusOracle(nn.Module):
+        def __init__(self, input_dim: int, latent_dim: int = 8):
+            super().__init__()
+            H = 512
+            self.backbone = nn.Sequential(
+                nn.Linear(input_dim, H), nn.LayerNorm(H), Mish(), nn.Dropout(0.10),
+                ResBlock(H), ResBlock(H), ResBlock(H), ResBlock(H),
+                nn.Linear(H, 256), Mish(), nn.Dropout(0.05),
+                nn.Linear(256, 128), Mish(),
+            )
+            self.median_head = nn.Linear(128, 1)
+            self.low_offset  = nn.Linear(128, 1)
+            self.high_offset = nn.Linear(128, 1)
+            self.enc = nn.Sequential(
+                nn.Linear(input_dim, 128), Mish(),
+                nn.Linear(128, 64),        Mish(),
+            )
+            self.fc_mu     = nn.Linear(64, latent_dim)
+            self.fc_logvar = nn.Linear(64, latent_dim)
+            self.dec = nn.Sequential(
+                nn.Linear(latent_dim, 64),  Mish(),
+                nn.Linear(64, 128),         Mish(),
+                nn.Linear(128, input_dim),
+            )
+
+        def encode(self, x):
+            h = self.enc(x)
+            return self.fc_mu(h), self.fc_logvar(h)
+
+        def reparameterize(self, mu, logvar):
+            return mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+
+        def forward(self, x):
+            f   = self.backbone(x)
+            med = self.median_head(f)
+            low = med - nn.functional.softplus(self.low_offset(f))
+            hig = med + nn.functional.softplus(self.high_offset(f))
+            mu, lv = self.encode(x)
+            z      = self.reparameterize(mu, lv)
+            recon  = self.dec(z)
+            return (med, low, hig), recon, mu, lv
+
+    _TORCH_AVAILABLE = True
+
+except ImportError:
+    _TORCH_AVAILABLE = False
+
+
+# ─────────────────────────────────────────────
+# 2. FEATURE ENGINEERING  (must match pegasus_oracle.py)
+# ─────────────────────────────────────────────
+
+NUMERIC_COLS = [
+    "log_anchor_runtime", "log_cpu_power", "log_ram",
+    "log_input_bytes", "log_io_intensity", "log_compute_intensity",
+    "memory_pressure", "site_encoded", "log_input_files_count",
+]
+
+RULE_BASED = {
+    "system::chmod", "pegasus::transfer", "sleep",
+    "pegasus::cleanup", "pegasus::dirmanager",
+    "pegasus::checkpoint:4.0", "preprocess", "mkdir",
+    "merge", "hello", "world",
+}
+
+
+def _synth(j):
+    return re.split(r"[-_]", str(j))[0] if j and not pd.isna(j) else "unknown"
+
+
+def _site(h):
+    h = str(h).lower()
+    for k, v in [("isi", 0), ("wsu", 1), ("anvil", 2), ("stampede", 3), ("expanse", 4)]:
+        if k in h:
+            return v
+    return 5
+
+
+def _bytes_bin(b):
+    if b <= 0:   return 0
+    if b < 1e4:  return 1
+    if b < 1e5:  return 2
+    if b < 1e6:  return 3
+    if b < 1e7:  return 4
+    if b < 1e8:  return 5
+    return 6
+
+
+def _bucket_key(row):
+    return (
+        _bytes_bin(row.get("input_bytes_total", 0)),
+        int(row.get("cpu_count", 1)),
+        _site(str(row.get("hostname", ""))),
+    )
+
+
+def _transform_names(transformations, vec, svd):
+    names = [str(t) if t else "unknown" for t in transformations]
+    return svd.transform(vec.transform(names)).astype(np.float32)
+
+
+def _make_features(df: pd.DataFrame, a: dict):
+    df = df.copy()
+    df["synth"] = df["job_id"].apply(_synth) if "job_id" in df.columns else "unknown"
+    for col, mm in a.get("res_med", {}).items():
+        if col in df.columns:
+            df[col] = df[col].replace(0, np.nan).fillna(
+                df["synth"].map(mm)).fillna(a["global_median"])
+    t           = (df["transformation"].map(a.get("trans_map", {}))
+                   if "transformation" in df.columns
+                   else pd.Series(np.nan, index=df.index))
+    s           = df["synth"].map(a.get("synth_map", {}))
+    df["_bkey"] = df.apply(_bucket_key, axis=1)
+    b_fallback  = df["_bkey"].map(a.get("bucket_map", {}))
+    df["anchor_runtime"]        = t.fillna(s).fillna(b_fallback).fillna(
+                                    a.get("global_median", 0))
+    df["log_anchor_runtime"]    = np.log1p(df["anchor_runtime"])
+    df["cpu_power"]             = df.get("cpu_count", 1) * df.get("cpu_speed", 1000)
+    df["log_cpu_power"]         = np.log1p(df["cpu_power"])
+    df["log_ram"]               = np.log1p(df.get("ram", 0))
+    df["log_input_bytes"]       = np.log1p(df.get("input_bytes_total", 0))
+    df["io_intensity"]          = (df.get("input_bytes_total", 0) /
+                                   (df.get("input_files_count", 0) + 1))
+    df["log_io_intensity"]      = np.log1p(df["io_intensity"])
+    df["compute_intensity"]     = (df.get("input_bytes_total", 0) /
+                                   (df["cpu_power"] + 1e-6))
+    df["log_compute_intensity"] = np.log1p(df["compute_intensity"])
+    df["memory_pressure"]       = df.get("ram", 0) / (df.get("cpu_count", 1) + 1e-6)
+    df["site_encoded"]          = (df["hostname"].apply(_site)
+                                   if "hostname" in df.columns else 0)
+    df["log_input_files_count"] = np.log1p(df.get("input_files_count", 0))
+    name_emb = _transform_names(
+        df.get("transformation", pd.Series(["unknown"] * len(df))),
+        a["name_vec"], a["name_svd"])
+    return df.fillna(0), name_emb
+
+
+def _assemble_X(df_eng, name_emb, numeric_cols):
+    return np.concatenate(
+        [df_eng[numeric_cols].values.astype(np.float32), name_emb], axis=1)
+
+
+# ─────────────────────────────────────────────
+# 3. CONDOR SLOT  (from extract_features.py)
+# ─────────────────────────────────────────────
+
+_DEFAULT_SLOT = {
+    "name":      "unknown",
+    "cpu_count": 4,
+    "cpu_speed": 2600.0,
+    "ram":       8_388_608.0,   # 8 GB in kB
+    "hostname":  "unknown",
+}
+
+
+def _get_condor_slot() -> dict:
+    """
+    Query condor_status -json and return the highest-speed slot.
+    Falls back silently to defaults when condor is not available.
+    """
+    try:
+        out       = subprocess.check_output(
+            ["condor_status", "-json"], stderr=subprocess.DEVNULL, timeout=15)
+        slots_raw = json.loads(out)
+    except Exception:
+        return dict(_DEFAULT_SLOT)
+
+    best = None
+    for s in slots_raw:
+        name = str(s.get("Name", s.get("Machine", "unknown")))
+        if re.search(r"slot\d+_\d+", name):
+            continue  # skip dynamic sub-slots
+
+        cpu_speed = float(s.get("ProcessorSpeed", 0))
+        if cpu_speed == 0:
+            kflops    = float(s.get("KFlops", 0))
+            cpu_speed = round(kflops / 1_000, 1) if kflops > 0 else 2_600.0
+
+        slot = {
+            "name":      name,
+            "cpu_count": int(s.get("Cpus", s.get("TotalSlotCpus", 1))),
+            "cpu_speed": cpu_speed,
+            "ram":       float(s.get("TotalSlotMemory",
+                                     s.get("Memory", 8_192))) * 1_024,
+            "hostname":  str(s.get("Machine", name)),
+        }
+        if best is None or slot["cpu_speed"] > best["cpu_speed"]:
+            best = slot
+
+    return best or dict(_DEFAULT_SLOT)
+
+
+# ─────────────────────────────────────────────
+# 4. MODEL CONTEXT  (inference only, matches api.py)
+# ─────────────────────────────────────────────
+
+class ModelContext:
+    def __init__(self, path: str):
+        if not _TORCH_AVAILABLE:
+            raise ImportError(
+                "Runtime prediction requires PyTorch. "
+                "Install with: pip install torch"
+            )
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+
+        self.scaler       = payload["scaler"]
+        self.numeric_cols = payload["numeric_cols"]
+        self.arts         = payload["arts"]
+        self.q_lo         = payload["q_lo"]
+        self.q_hi         = payload["q_hi"]
+        self.rule_map     = payload["rule_map"]
+        self.lat_dim      = payload["lat_dim"]
+        self.input_dim    = payload["input_dim"]
+        self.sparse_thr   = payload.get("sparse_thr", 10)
+        self.device       = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu")
+
+        self.model = PegasusOracle(self.input_dim, latent_dim=self.lat_dim)
+        self.model.load_state_dict(payload["model_state"])
+        self.model.to(self.device).eval()
+
+        self.known_trans  = set(self.arts["trans_map"].keys())
+        self.trans_counts = self.arts.get("trans_counts", {})
+        self.smart_rule   = self.arts.get("smart_rule", {})
+
+    def predict(self, df: pd.DataFrame):
+        df_eng, name_emb = _make_features(df, self.arts)
+        X = self.scaler.transform(_assemble_X(df_eng, name_emb, self.numeric_cols))
+        with torch.no_grad():
+            (pm, pl, ph), _, _, _ = self.model(
+                torch.FloatTensor(X).to(self.device))
+
+        p_med  = np.expm1(pm.cpu().numpy().flatten())
+        p_low  = np.clip(np.expm1(pl.cpu().numpy().flatten()), 0, None)
+        p_high = np.expm1(ph.cpu().numpy().flatten())
+
+        statuses = []
+        for i, row in enumerate(df.itertuples(index=False)):
+            trans   = getattr(row, "transformation", "")
+            n_train = self.trans_counts.get(trans, 0)
+            if trans in self.rule_map:
+                rv        = self.rule_map[trans]
+                p_med[i]  = rv
+                p_low[i]  = rv * 0.5
+                p_high[i] = rv * 2.0
+                statuses.append("RULE_BASED")
+            elif n_train < self.sparse_thr and trans in self.smart_rule:
+                sr        = self.smart_rule[trans]
+                p_med[i]  = sr["median"]
+                p_low[i]  = sr["low"]
+                p_high[i] = sr["high"]
+                statuses.append("SPARSE")
+            elif trans not in self.known_trans:
+                statuses.append("ZERO_SHOT")
+            else:
+                statuses.append("NORMAL")
+
+        return p_med, p_low, p_high, statuses
+
+
+# ─────────────────────────────────────────────
+# 5. FEATURE EXTRACTION FROM WORKFLOW OBJECT
+# ─────────────────────────────────────────────
+
+def _condor_profiles(job) -> dict:
+    """Return the Condor-namespace profile dict from a job, key-agnostic."""
+    for ns_key, profs in job.profiles.items():
+        ns_val = ns_key.value if hasattr(ns_key, "value") else str(ns_key)
+        if ns_val == "condor":
+            return dict(profs)
+    return {}
+
+
+def _full_trans_name(job) -> str:
+    """Build the canonical transformation name: [namespace::]name[:version]."""
+    name = getattr(job, "transformation", None) or "unknown"
+    ns   = getattr(job, "namespace",      None)
+    ver  = getattr(job, "version",        None)
+    if ns:
+        name = f"{ns}::{name}"
+    if ver:
+        name = f"{name}:{ver}"
+    return name
+
+
+def _build_dag_levels(workflow) -> List[List]:
+    """
+    Topological sort of workflow jobs into levels.
+
+    Level 0 = source jobs (no inputs from other jobs).
+    Level N = jobs whose all upstream jobs are in levels < N.
+
+    Returns a list of levels, each level is a list of (job_id, job) tuples.
+    """
+    # Map: file lfn → job_id that produces it
+    producer = {}
+    for jid, job in workflow.jobs.items():
+        for f in job.get_outputs() if hasattr(job, "get_outputs") else []:
+            producer[f.lfn] = jid
+
+    # Build dependency map: job_id → set of job_ids it depends on
+    deps = {jid: set() for jid in workflow.jobs}
+    for jid, job in workflow.jobs.items():
+        for f in job.get_inputs() if hasattr(job, "get_inputs") else []:
+            parent = producer.get(f.lfn)
+            if parent and parent != jid:
+                deps[jid].add(parent)
+
+    # Kahn's algorithm
+    levels   = []
+    assigned = set()
+    remaining = set(workflow.jobs.keys())
+
+    while remaining:
+        level = [
+            jid for jid in remaining
+            if deps[jid].issubset(assigned)
+        ]
+        if not level:
+            # cycle or unresolved — add remaining as one last level
+            level = list(remaining)
+        levels.append([(jid, workflow.jobs[jid]) for jid in level])
+        for jid in level:
+            assigned.add(jid)
+            remaining.discard(jid)
+
+    return levels
+
+
+def _extract_features(workflow, slot: dict, arts: dict) -> pd.DataFrame:
+    """
+    Build one feature row per job in the workflow using DAG-level traversal.
+
+    Walks the DAG level by level (topological order):
+      - Level 0 (source jobs): uses File.size directly — sizes are known
+      - Level N (middle/sink): input sizes are propagated from upstream outputs
+        using the output_ratio per transformation stored in arts, so middle
+        jobs get a realistic input_bytes_total instead of 0
+
+    All rows are collected across all levels and returned as a single DataFrame
+    for one batch prediction pass.
+
+    SubWorkflow and Pegasus/system auxiliary jobs are skipped at every level.
+    """
+    # file lfn → estimated size in bytes (seeded from known File.size values)
+    file_size_map: dict = {}
+    for jid, job in workflow.jobs.items():
+        for f in (job.get_inputs() if hasattr(job, "get_inputs") else []):
+            if hasattr(f, "size") and f.size:
+                file_size_map[f.lfn] = float(f.size)
+        for f in (job.get_outputs() if hasattr(job, "get_outputs") else []):
+            if hasattr(f, "size") and f.size:
+                file_size_map[f.lfn] = float(f.size)
+
+    output_ratio = arts.get("output_ratio", {})
+
+    rows      = []
+    level_map = {}  # job_id → level index (for reporting)
+
+    for level_idx, level in enumerate(_build_dag_levels(workflow)):
+        for jid, job in level:
+            if not hasattr(job, "transformation"):
+                continue  # SubWorkflow
+            ns = getattr(job, "namespace", None)
+            if ns in ("pegasus", "system"):
+                continue  # aux job
+
+            condor   = _condor_profiles(job)
+            cpu_req  = int(condor.get("request_cpus", slot["cpu_count"]))
+            ram_mb   = float(condor.get("request_memory", 0))
+            ram_kb   = ram_mb * 1_024 if ram_mb > 0 else slot["ram"]
+
+            inputs            = job.get_inputs() if hasattr(job, "get_inputs") else []
+            input_files_count = len(inputs)
+            input_bytes_total = sum(
+                file_size_map.get(f.lfn, 0.0) for f in inputs
+            )
+
+            rows.append({
+                "job_id":            jid,
+                "transformation":    _full_trans_name(job),
+                "dag_level":         level_idx,
+                "cpu_count":         cpu_req,
+                "cpu_speed":         slot["cpu_speed"],
+                "ram":               ram_kb,
+                "input_bytes_total": float(input_bytes_total),
+                "input_files_count": input_files_count,
+                "hostname":          slot["hostname"],
+            })
+            level_map[jid] = level_idx
+
+            # Propagate estimated output sizes to downstream jobs
+            trans      = _full_trans_name(job)
+            ratio      = output_ratio.get(trans, 1.0)
+            est_output = input_bytes_total * ratio
+            for f in (job.get_outputs() if hasattr(job, "get_outputs") else []):
+                if f.lfn not in file_size_map:
+                    file_size_map[f.lfn] = est_output
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+# ─────────────────────────────────────────────
+# 6. WORKFLOW-LEVEL PREDICTOR
+# ─────────────────────────────────────────────
+
+class WorkflowRuntimePredictor:
+    """
+    Workflow-level runtime predictor.
+
+    Loads the PegasusOracle model once, runs a single batch inference
+    pass over every job in the workflow (source, middle, and sink), and
+    writes two output files to the workflow output directory.
+
+    Usage — explicit config::
+
+        cfg = RuntimePredictionConfig(
+            model_path  = "pegasus_oracle_model.pkl",
+            output_dir  = "/submit/dir",
+            q_lo        = 0.10,
+            q_hi        = 0.90,
+        )
+        predictor = WorkflowRuntimePredictor(cfg)
+        results   = predictor.predict(workflow)
+
+    Usage — from pegasus.properties::
+
+        cfg = RuntimePredictionConfig.from_properties(props)
+        WorkflowRuntimePredictor(cfg).predict(workflow)
+
+    Output files:
+        runtime_predictions.csv   — tabular results, one row per job
+        runtime_predictions.json  — same data + summary stats and slot info
+    """
+
+    def __init__(self, config: RuntimePredictionConfig):
+        """
+        :param config: :py:class:`RuntimePredictionConfig` instance
+        :raises ValueError: if config.model_path is not set
+        :raises FileNotFoundError: if the model file does not exist
+        :raises ImportError: if PyTorch or scikit-learn are not installed
+        """
+        if not config.model_path:
+            if _DEFAULT_MODEL.exists():
+                config.model_path = str(_DEFAULT_MODEL)
+            else:
+                raise ValueError(
+                    "No model found. Either set pegasus.runtime.prediction.model.path "
+                    "in pegasus.properties, or place pegasus_oracle_model.pkl in: "
+                    f"{_MODELS_DIR}"
+                )
+        if not os.path.isfile(config.model_path):
+            raise FileNotFoundError(
+                f"Model not found: {config.model_path}. "
+                "Train the model via pegasus_oracle.py and place the .pkl in "
+                f"{_MODELS_DIR} or set pegasus.runtime.prediction.model.path."
+            )
+        self._cfg        = config
+        self._ctx        = ModelContext(config.model_path)
+
+        # Apply config overrides to the loaded model context
+        if config.sparse_threshold is not None:
+            self._ctx.sparse_thr = config.sparse_threshold
+        if config.q_lo is not None:
+            self._ctx.q_lo = config.q_lo
+        if config.q_hi is not None:
+            self._ctx.q_hi = config.q_hi
+
+    def predict(self, workflow) -> List[dict]:
+        """
+        Predict runtimes for all jobs in *workflow* and write output files.
+
+        Output directory is taken from ``config.output_dir``; if not set it
+        falls back to the workflow's submit dir (``workflow._submit_dir``) or
+        the current working directory.
+
+        :param workflow: a Pegasus Workflow object
+        :return: list of prediction dicts (one per job, same content as CSV rows)
+        """
+        if not self._cfg.enabled:
+            return []
+
+        output_dir = (
+            self._cfg.output_dir
+            or getattr(workflow, "_submit_dir", None)
+            or str(Path.cwd())
+        )
+        output_dir = str(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # ── Step 1: resolve compute slot ──────────────────────────────────
+        slot = _get_condor_slot()
+        # Apply any slot overrides from config
+        if self._cfg.slot_hostname  is not None: slot["hostname"]  = self._cfg.slot_hostname
+        if self._cfg.slot_cpu_count is not None: slot["cpu_count"] = self._cfg.slot_cpu_count
+        if self._cfg.slot_cpu_speed is not None: slot["cpu_speed"] = self._cfg.slot_cpu_speed
+        if self._cfg.slot_ram       is not None: slot["ram"]       = self._cfg.slot_ram
+
+        # ── Step 2: build feature matrix level-by-level, then collect all ───
+        df = _extract_features(workflow, slot, self._ctx.arts)
+        if df.empty:
+            return []
+
+        # ── Step 3: single batch forward pass ─────────────────────────────
+        p_med, p_low, p_high, statuses = self._ctx.predict(df)
+        ip_pct = int(round((self._ctx.q_hi - self._ctx.q_lo) * 100))
+
+        # ── Step 4: assemble result rows ───────────────────────────────────
+        results = []
+        for i, row in enumerate(df.itertuples(index=False)):
+            results.append({
+                "job_id":              row.job_id,
+                "transformation":      row.transformation,
+                "dag_level":           int(row.dag_level),
+                "status":              statuses[i],
+                "predicted_runtime_s": round(float(p_med[i]), 1),
+                "lower_bound_s":       round(float(p_low[i]),  1),
+                "upper_bound_s":       round(float(p_high[i]), 1),
+                "interval_pct":        ip_pct,
+                "min_wall_time_mins":  max(1, math.ceil(float(p_low[i])  / 60)),
+                "max_wall_time_mins":  max(1, math.ceil(float(p_high[i]) / 60)),
+                "input_files_count":   int(row.input_files_count),
+                "input_bytes_total":   float(row.input_bytes_total),
+                "cpu_count":           int(row.cpu_count),
+                "hostname":            row.hostname,
+            })
+
+        # ── Step 5: write CSV ──────────────────────────────────────────────
+        csv_path = os.path.join(output_dir, "runtime_predictions.csv")
+        pd.DataFrame(results).to_csv(csv_path, index=False)
+
+        # ── Step 6: write JSON with summary ───────────────────────────────
+        n_levels = int(df["dag_level"].max()) + 1 if not df.empty else 0
+        summary = {
+            "workflow_name":  getattr(workflow, "name", "unknown"),
+            "total_jobs":     len(results),
+            "dag_levels":     n_levels,
+            "status_counts":  dict(Counter(statuses)),
+            "interval_pct":   ip_pct,
+            "model_path":     self._cfg.model_path,
+            "slot_used":      slot,
+            "config": {
+                "sparse_threshold": self._ctx.sparse_thr,
+                "q_lo":             self._ctx.q_lo,
+                "q_hi":             self._ctx.q_hi,
+            },
+            "predictions":    results,
+        }
+        json_path = os.path.join(output_dir, "runtime_predictions.json")
+        with open(json_path, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        return results

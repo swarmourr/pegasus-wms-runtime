@@ -1,0 +1,20 @@
+#!/bin/bash
+
+set -e
+
+WORK_DIR=`mktemp -d`
+REMOTE_REPO=download.pegasus.isi.edu:/data/webspace/download.pegasus.isi.edu/wms/download/rhel
+
+rm -rf $WORK_DIR
+rsync -a -v -e ssh $REMOTE_REPO/ $WORK_DIR/
+
+cd $WORK_DIR
+for DER in `find . -type d -name i386 -o -name x86_64`; do 
+    cd $WORK_DIR/$DER
+    createrepo .
+done
+
+rsync -a -v -e ssh $WORK_DIR/ $REMOTE_REPO/
+
+rm -rf $WORK_DIR
+

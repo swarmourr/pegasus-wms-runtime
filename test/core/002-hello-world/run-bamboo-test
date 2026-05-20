@@ -1,0 +1,7 @@
+#!/bin/bash
+
+set -e
+set -v
+
+# generate the workflow and submit all in one go
+PYTHONPATH=$(pegasus-config --python) ./hello-world.py

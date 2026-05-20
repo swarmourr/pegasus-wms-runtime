@@ -1,0 +1,46 @@
+#!/bin/bash
+#set -x
+set -e
+
+TOP_DIR=`pwd`
+
+# determine TEST_NAME to setup site catalog
+if [ X${testdir} = "X" ]; then
+    testdir=`dirname  $0`
+fi
+TESTDIR=$(cd $testdir && pwd)
+TEST_NAME=`basename $TESTDIR`
+export TEST_NAME
+
+
+#input file directory
+input_dir=/scitech/shared/scratch-90-days/bamboo/${TEST_NAME}
+mkdir -p ${input_dir}
+
+# untar the pegasus worker package from local install to a shared dir
+# available on all the compute nodes
+PEGASUS_WORKER_PACKAGE_DIR=`pegasus-config --java`/../worker-packages/
+tar xzf $PEGASUS_WORKER_PACKAGE_DIR/pegasus-worker-*.tar.gz -C ${input_dir}
+worker_package_dir=$(tar tzf $PEGASUS_WORKER_PACKAGE_DIR/pegasus-worker-*.tar.gz  | head | sed 's;/.*;;' | sort | uniq)
+set -o pipefail
+
+# pegasus bin directory is needed to find keg.
+# has to be keg in a directory visible to all compute nodes
+PEGASUS_SHARED_BIN_DIR=${input_dir}/${worker_package_dir}/bin
+export PEGASUS_SHARED_BIN_DIR
+echo "bin dir from untarred worker package dir  ${PEGASUS_SHARED_BIN_DIR}"
+
+echo "Running blackdiamond.py"
+PYTHONPATH=$(pegasus-config --python) python3 blackdiamond.py 2>&1 | tee $TOP_DIR/plan.out
+
+
+WORK_DIR=`cat plan.out | grep pegasus-remove | sed -E 's/.*pegasus-remove[ ]+(.*)[ ]*/\1/'`
+# account for deep submit directory structure
+cd $WORK_DIR/00/00
+
+NUM_JOBS=`find $WORK_DIR -name "stage_in*sub" | wc -l`
+
+if [ "$NUM_JOBS" -gt "0" ]; then
+    echo "ERROR: planner created $NUM_JOBS stage_in jobs . It should have created 0 as bypass is set for all files in workflow"
+    exit 1
+fi

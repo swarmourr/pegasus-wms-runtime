@@ -1,0 +1,50 @@
+#!/bin/bash
+
+set -e
+
+TOP_DIR=`pwd`
+
+# download rosetta binary - this is to save space in the Pegasus distribution
+if [ ! -e rosetta.exe ]; then
+   wget -q -O rosetta.exe http://pegasus.isi.edu/wms/example-workflows/rosetta/fake-rosetta.exe
+   chmod 755 rosetta.exe
+fi
+
+# do we have the required minirosetta_database?
+if [ ! -e minirosetta_database ]; then
+   wget -q http://pegasus.isi.edu/wms/example-workflows/rosetta/minirosetta_database.tar.gz
+   tar xzf minirosetta_database.tar.gz
+   rm minirosetta_database.tar.gz
+fi
+
+# what about the required pdbs?
+if [ ! -e pdbs ]; then
+   wget -q http://pegasus.isi.edu/wms/example-workflows/rosetta/pdbs.tar.gz
+   tar xzf pdbs.tar.gz
+   rm pdbs.tar.gz
+fi
+
+echo "Running Rosetta.py"
+export PYTHONPATH=$(pegasus-config --python)
+python3 Rosetta.py 2>&1 | tee plan.out
+
+WORK_DIR=`cat plan.out | grep submit_dir | awk '{print $NF}' | sed -e 's/[",]//g'`
+echo "Looks like the workflow directory is: $WORK_DIR"
+cd $WORK_DIR
+
+echo
+echo
+echo "Checking workflow files..."
+
+# check the cache to make sure it only has the expected URLS
+(cat rosetta-0.cache | grep -v "file-based replica catalog" | grep -v " http://" | grep -v "^rosetta.exe" >$TOP_DIR/cache.urls) || /bin/true
+if [ -s $TOP_DIR/cache.urls ]; then
+    echo "Fatal: Unexected URLs found in rosetta-0.cache:"
+    cat $TOP_DIR/cache.urls
+    exit 1
+fi
+
+echo
+echo
+echo "Starting the workflow..."
+pegasus-run $WORK_DIR

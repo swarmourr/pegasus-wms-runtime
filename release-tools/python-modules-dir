@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# this script figures out the location of the system Python
+# modules - note that we are using the python in /usr/bin
+# for this, and not the one in the users environment
+
+SYSLIB="$1"
+
+if [ "$(uname -s)" == "Darwin" ]; then
+    echo "$SYSLIB/python/dist-packages"
+    exit 0
+fi
+
+PYTHON=$($(dirname $0)/get-system-python)
+
+VERSION=`$PYTHON -V 2>&1 | sed -e 's/^.* \([0-9]\.[0-9][0-9]\?\).*$/\1/'`
+
+# default
+FINAL_LOCATION="$SYSLIB/python$VERSION/dist-packages"
+
+for LOCATION in \
+    "/usr/$SYSLIB/python$VERSION/dist-packages" \
+    "/usr/$SYSLIB/python$VERSION/site-packages" \
+    "/Library/Python/$VERSION/site-packages" \
+; do
+    if [ -e "$LOCATION" ]; then
+        FINAL_LOCATION="$LOCATION"
+        break
+    fi
+done
+
+# remote the prefix
+FINAL_LOCATION=`echo "$FINAL_LOCATION" | sed -e 's/^\/usr//' | sed -e 's:^/*::'`
+
+echo $FINAL_LOCATION

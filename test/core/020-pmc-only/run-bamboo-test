@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# Figure out where Pegasus is installed
+export PATH=$WORK_DIR/pegasus-install/bin:$PATH
+export PEGASUS_BIN_DIR=`pegasus-config --bin`
+if [ "x$PEGASUS_BIN_DIR" = "x" ]; then
+    echo "Please make sure pegasus-plan is in your path"
+    exit 1
+fi
+
+echo "Planning workflow..."
+./plan.sh
+if [ $? -ne 0 ]; then
+    echo "Planning failed"
+    exit 1
+fi
+
+RUN_DIR=$(find submit -name 'run00*' | sort -n | tail -1)
+RUN_DIR=$(cd $RUN_DIR && pwd)
+echo "RUN_DIR is $RUN_DIR"
+
+echo "Running PMC..."
+/usr/lib64/mpich/bin/mpiexec -n 4 $PEGASUS_BIN_DIR/pegasus-mpi-cluster --monitord-hack --max-wall-time 5 $RUN_DIR/pmc-only-0.dag
+RC=$?
+if [ $RC -ne 0 ]; then
+    exit 1
+fi
+
+echo "Running monitord..."
+pegasus-monitord -N -r $RUN_DIR/pmc-only-0.dag.dagman.out >$RUN_DIR/monitord.log 2>&1
+RC=$?
+if [ $RC -ne 0 ]; then
+    echo "Monitord failed"
+    exit 1
+fi
+if [ $(grep -c ERROR $RUN_DIR/monitord.log*) -gt 0 ]; then
+    echo "Monitord log contained errors"
+    exit 1
+fi
+
+TASKS=$(echo "select count(*) from task;" | sqlite3 $RUN_DIR/pmc-only-0.stampede.db)
+if [ $TASKS -ne 40 ]; then
+    echo "Not enough tasks $TASKS in stampede database. Expected 40"
+    exit 1
+fi
+
+JOBS=$(echo "select count(*) from job_instance;" | sqlite3 $RUN_DIR/pmc-only-0.stampede.db)
+if [ $JOBS -ne 46 ]; then
+    echo "Not enough jobs $JOBS in stampede database. Expected 46"
+    exit 1
+fi
+
+INVOCATIONS=$(echo "select count(*) from invocation;" | sqlite3 $RUN_DIR/pmc-only-0.stampede.db)
+if [ $INVOCATIONS -ne 46 ]; then
+    echo "Not enough invocations $INVOCATIONS in stampede database. Expected 46"
+    exit 1
+fi
+

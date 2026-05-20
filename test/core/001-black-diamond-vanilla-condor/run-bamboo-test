@@ -1,0 +1,69 @@
+#!/bin/bash
+
+set -e
+set -v
+
+TOPDIR=`pwd`
+
+# generate the input file
+echo "This is sample input to KEG" >f.a
+
+# output directory
+mkdir -p outputs
+
+# build the dax generator
+CLASSPATH=.:$(pegasus-config --classpath) javac BlackDiamondDAX.java
+
+# generate the dax
+CLASSPATH=.:$(pegasus-config --classpath) java BlackDiamondDAX /usr blackdiamond.dax
+
+# create the site catalog
+cat > sites.yml <<EOF
+pegasus: "5.0"
+sites:
+ -
+  name: "condorpool"
+  arch: "x86_64"
+  os.type: "linux"
+  profiles:
+    env:
+      PEGASUS_HOME: "/usr"
+    condor:
+      universe: "vanilla"
+    pegasus:
+      style: "condor"
+ -
+  name: "local"
+  arch: "x86_64"
+  os.type: "linux"
+  directories:
+   -
+    type: "sharedStorage"
+    path: "$TOPDIR/outputs"
+    fileServers:
+     -
+      operation: "all"
+      url: "file://$TOPDIR/outputs"
+   -
+    type: "sharedScratch"
+    path: "$TOPDIR/work/shared-scratch"
+    fileServers:
+     -
+      operation: "all"
+      url: "file://$TOPDIR/work/shared-scratch"
+
+EOF
+
+# plan and submit the  workflow
+pegasus-plan \
+    --conf pegasusrc \
+    --sites condorpool \
+    --staging-site local \
+    --dir work/dags \
+    --output-sites local \
+    --cleanup leaf \
+    --submit \
+    --randomdir \
+    blackdiamond.dax \
+    | tee plan.out
+

@@ -137,6 +137,8 @@ def _create_pred_sub(dag_dir: Path, job_id: str, wf_yaml: str,
         f"output         = {out}\n"
         f"error          = {err}\n"
         f"should_transfer_files = NO\n"
+        f"+pegasus_job_type = \"auxillary\"\n"
+        f"+pegasus_wf_xformation = \"pegasus::runtime-predictor\"\n"
         f"queue\n"
     )
     return str(sub)

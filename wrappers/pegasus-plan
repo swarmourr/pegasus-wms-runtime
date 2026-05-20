@@ -162,7 +162,7 @@ def _inject_prediction_jobs(dag_path: str, wf_yaml: str, output_dir: str):
 
     job_lines = []
     dep_lines = []
-    prev_pred = None
+    prev_level_jobs = None   # user job IDs at the previous level
 
     for lvl_idx, level_jobs in enumerate(levels):
         pred_id  = f"pegasus_runtime_pred_L{lvl_idx}"
@@ -170,15 +170,17 @@ def _inject_prediction_jobs(dag_path: str, wf_yaml: str, output_dir: str):
 
         job_lines.append(f"JOB {pred_id} {sub_file}")
 
-        # pred-LN → every user job at level N  (pred runs first)
+        # pred-LN runs before every user job at level N
         for jid in level_jobs:
             dep_lines.append(f"PARENT {pred_id} CHILD {jid}")
 
-        # pred-L(N-1) → pred-LN  (serial chain between levels)
-        if prev_pred:
-            dep_lines.append(f"PARENT {prev_pred} CHILD {pred_id}")
+        # pred-LN must wait for ALL user jobs at level N-1 to finish
+        # (so it can read actual output file sizes from disk)
+        if prev_level_jobs:
+            for jid in prev_level_jobs:
+                dep_lines.append(f"PARENT {jid} CHILD {pred_id}")
 
-        prev_pred = pred_id
+        prev_level_jobs = level_jobs
 
     with open(dag_path, "a") as f:
         f.write("\n# ── Runtime Prediction Jobs (injected by pegasus-plan wrapper) ──\n")
@@ -210,12 +212,16 @@ result  = subprocess.run(
 # Stream output to user
 print(result.stdout, end="", flush=True)
 
+print(f"[pegasus-plan] wf_yaml={wf_yaml!r}  returncode={result.returncode}", flush=True)
 if result.returncode == 0 and wf_yaml:
     dag_path = _find_dag_file(result.stdout)
+    print(f"[pegasus-plan] dag_path={dag_path!r}", flush=True)
     if dag_path:
         output_dir = str(Path(wf_yaml).parent / "output")
         _inject_prediction_jobs(dag_path, wf_yaml, output_dir)
     else:
         print("[pegasus-plan] Could not locate .dag file — prediction not injected.", flush=True)
+elif result.returncode == 0 and not wf_yaml:
+    print("[pegasus-plan] No workflow YAML found in args — skipping injection.", flush=True)
 
 sys.exit(result.returncode)

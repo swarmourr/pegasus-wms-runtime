@@ -145,12 +145,14 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
             "uses": [],
             "profiles": {
                 "pegasus": {
-                    "job.type":       "auxillary",
-                    "label":          f"runtime-prediction-L{lvl_idx}",
-                    "execution.site": "local",   # run on submit machine like stage-in
+                    "job.type": "auxillary",
+                    "label":    f"runtime-prediction-L{lvl_idx}",
+                },
+                "selector": {
+                    "execution.site": "local",   # force local site like stage-in jobs
                 },
                 "condor": {
-                    "universe": "local",
+                    "universe": "local",         # belt-and-suspenders: local universe
                 },
             },
         })

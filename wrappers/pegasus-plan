@@ -375,9 +375,6 @@ def _inject_prediction_jobs(dag_path: str, wf_yaml: str, output_dir: str):
     # Patch the Graphviz .dot file so prediction jobs are visible
     _patch_dot_file(dag_dir, levels, all_job_ids)
 
-    # Register jobs in the workflow DB so pegasus-status can track them
-    _register_jobs_in_db(dag_dir, bd, list(sub_files.keys()), sub_files)
-
     print(
         f"[pegasus-plan] Injected {len(levels)} runtime prediction job(s) into DAG.",
         flush=True,

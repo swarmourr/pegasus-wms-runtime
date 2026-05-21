@@ -184,6 +184,14 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
                     "pfn":  _PREDICTOR,
                     "type": "installed",
                 },
+                {
+                    "name": "condorpool",
+                    "pfn":  _PREDICTOR,
+                    "type": "installed",
+                    "profiles": {
+                        "condor": {"universe": "local"},
+                    },
+                },
             ],
         })
     tc["transformations"] = transforms

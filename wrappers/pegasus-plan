@@ -122,13 +122,29 @@ def _parse_dag_levels(dag_text: str):
     return levels
 
 
+def _job_subdir(dag_dir: Path) -> Path:
+    """
+    Return the submit-file subdirectory Pegasus uses (e.g. run00XX/00/00/).
+    Falls back to dag_dir itself if no subdirectory structure is found.
+    """
+    # Pegasus creates numeric two-level dirs: 00/00, 00/01, ...
+    for d1 in sorted(dag_dir.iterdir()):
+        if d1.is_dir() and d1.name.isdigit():
+            for d2 in sorted(d1.iterdir()):
+                if d2.is_dir() and d2.name.isdigit():
+                    return d2
+    return dag_dir
+
+
 def _create_pred_sub(dag_dir: Path, job_id: str, wf_yaml: str,
                      output_dir: str, level_idx: int) -> str:
     """Write an HTCondor submit file for a prediction job."""
-    sub = dag_dir / f"{job_id}.sub"
-    log = dag_dir / f"{job_id}.log"
-    out = dag_dir / f"{job_id}.out"
-    err = dag_dir / f"{job_id}.err"
+    sub_dir = _job_subdir(dag_dir)
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    sub = sub_dir / f"{job_id}.sub"
+    log = sub_dir / f"{job_id}.log"
+    out = sub_dir / f"{job_id}.out"
+    err = sub_dir / f"{job_id}.err"
     sub.write_text(
         f"universe       = local\n"
         f"executable     = {sys.executable}\n"

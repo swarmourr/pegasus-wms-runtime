@@ -208,6 +208,44 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
     return str(tmp_path)
 
 
+def _read_property(key: str) -> str | None:
+    """Read a single key from pegasus.properties in the current directory."""
+    props_file = Path("pegasus.properties")
+    if props_file.exists():
+        for line in props_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith(key):
+                return line.split("=", 1)[-1].strip()
+    return None
+
+
+def _model_path() -> str | None:
+    """
+    Resolve the model .pkl path.
+    Priority: env var → pegasus.properties → default package location.
+    Returns None if no model file is found anywhere.
+    """
+    # 1. Explicit env var
+    env = os.environ.get("PEGASUS_RUNTIME_PREDICTION_MODEL")
+    if env and Path(env).is_file():
+        return env
+
+    # 2. pegasus.properties key
+    prop = _read_property("pegasus.runtime.prediction.model.path")
+    if prop and Path(prop).is_file():
+        return prop
+
+    # 3. Default location: <repo>/packages/pegasus-python/src/Pegasus/models/
+    default = (
+        _SRC_DIR / "packages" / "pegasus-python"
+        / "src" / "Pegasus" / "models" / "pegasus_oracle_model.pkl"
+    )
+    if default.is_file():
+        return str(default)
+
+    return None
+
+
 def _prediction_enabled() -> bool:
     """
     Check pegasus.properties for pegasus.runtime.prediction.enable.
@@ -216,13 +254,9 @@ def _prediction_enabled() -> bool:
     """
     if os.environ.get("PEGASUS_RUNTIME_PREDICTION", "").lower() in ("false", "0", "no"):
         return False
-    props_file = Path("pegasus.properties")
-    if props_file.exists():
-        for line in props_file.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("pegasus.runtime.prediction.enable"):
-                val = line.split("=", 1)[-1].strip().lower()
-                return val not in ("false", "0", "no")
+    val = _read_property("pegasus.runtime.prediction.enable")
+    if val is not None:
+        return val.lower() not in ("false", "0", "no")
     return True
 
 
@@ -235,18 +269,23 @@ real    = _real_pegasus_plan()
 tmp_wf = None
 plan_args = list(args)
 
-if wf_yaml and _prediction_enabled():
-    tmp_wf = _build_temp_workflow(wf_yaml)
-    if tmp_wf:
-        wf_abs = str(Path(wf_yaml).resolve())
-        plan_args = [tmp_wf if (a == wf_yaml or a == wf_abs) else a for a in args]
-        print("[pegasus-plan] Runtime prediction enabled — injecting predictor jobs.",
-              flush=True)
+if wf_yaml:
+    model = _model_path()
+    if not _prediction_enabled():
+        print("[pegasus-plan] Runtime prediction disabled — skipping injection.", flush=True)
+    elif model is None:
+        print("[pegasus-plan] No model found — runtime prediction disabled. "
+              "Train a model or set pegasus.runtime.prediction.model.path.", flush=True)
     else:
-        print("[pegasus-plan] Could not build temp workflow — planning without prediction jobs.",
-              flush=True)
-elif wf_yaml and not _prediction_enabled():
-    print("[pegasus-plan] Runtime prediction disabled — skipping injection.", flush=True)
+        tmp_wf = _build_temp_workflow(wf_yaml)
+        if tmp_wf:
+            wf_abs = str(Path(wf_yaml).resolve())
+            plan_args = [tmp_wf if (a == wf_yaml or a == wf_abs) else a for a in args]
+            print(f"[pegasus-plan] Runtime prediction enabled (model: {model}) "
+                  f"— injecting predictor jobs.", flush=True)
+        else:
+            print("[pegasus-plan] Could not build temp workflow — planning without prediction jobs.",
+                  flush=True)
 
 # Run real pegasus-plan (streams output directly — no capture needed)
 result = subprocess.run([real] + plan_args)

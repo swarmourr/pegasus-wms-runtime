@@ -119,10 +119,14 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
 
     output_dir = str(Path(wf_yaml).resolve().parent / "output")
 
-    # ── Add one prediction job per level ──────────────────────────────────
+    # ── Build dependency map for merging ──────────────────────────────────
+    # dep_map: job_id → set of children (mutable, will be serialised back)
+    dep_map = {}
+    for dep in deps:
+        pid = dep.get("id")
+        dep_map[pid] = set(dep.get("children", []))
+
     new_jobs = []
-    new_deps = list(deps)
-    prev_pred_id = None
 
     for lvl_idx, level_job_ids in enumerate(levels):
         pred_id = f"pegasus_runtime_pred_L{lvl_idx}"
@@ -149,33 +153,16 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
         })
 
         # pred-LN → user jobs at level N
-        new_deps.append({"id": pred_id, "children": list(level_job_ids)})
+        dep_map.setdefault(pred_id, set()).update(level_job_ids)
 
-        # user jobs at level N-1 → pred-LN
-        if prev_pred_id is not None:
-            # find the dep entry for prev_pred_id and add pred_id as child
-            new_deps.append({"id": prev_pred_id + "_to_next",
-                             "id": prev_pred_id,
-                             "children": [pred_id]})
-        else:
-            # L0: chain all level-0 job completions → pred-L1 handled below
-            pass
-
-        # For N>0: level N-1 user jobs → pred-LN
+        # user jobs at level N-1 → pred-LN  (so pred-LN waits for real data)
         if lvl_idx > 0:
-            prev_level_ids = levels[lvl_idx - 1]
-            for pjid in prev_level_ids:
-                # Add pred_id as child of each prev-level job
-                added = False
-                for dep in new_deps:
-                    if dep.get("id") == pjid:
-                        dep.setdefault("children", []).append(pred_id)
-                        added = True
-                        break
-                if not added:
-                    new_deps.append({"id": pjid, "children": [pred_id]})
+            for pjid in levels[lvl_idx - 1]:
+                dep_map.setdefault(pjid, set()).add(pred_id)
 
-        prev_pred_id = pred_id
+    # Serialise dep_map back to list-of-dicts
+    new_deps = [{"id": pid, "children": sorted(cids)}
+                for pid, cids in dep_map.items() if cids]
 
     wf["jobs"] = jobs + new_jobs
     wf["dependencies"] = new_deps
@@ -204,9 +191,9 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
     tc["transformations"] = transforms
     wf["transformationCatalog"] = tc
 
-    # Write temp file next to original
-    orig = Path(wf_yaml)
-    tmp_path = orig.parent / f".pegasus_pred_{orig.name}"
+    # Write temp file next to original — absolute path, no leading dot
+    orig = Path(wf_yaml).resolve()
+    tmp_path = orig.parent / f"_pred_{orig.name}"
     with open(tmp_path, "w") as f:
         yaml.dump(wf, f, default_flow_style=False, sort_keys=False)
 
@@ -225,8 +212,9 @@ plan_args = list(args)
 if wf_yaml:
     tmp_wf = _build_temp_workflow(wf_yaml)
     if tmp_wf:
-        # Replace original workflow path with temp path in args
-        plan_args = [tmp_wf if a == wf_yaml else a for a in args]
+        # Replace original workflow path with absolute temp path in args
+        wf_abs = str(Path(wf_yaml).resolve())
+        plan_args = [tmp_wf if (a == wf_yaml or a == wf_abs) else a for a in args]
         print(f"[pegasus-plan] Injected prediction jobs into temp workflow for planning.",
               flush=True)
     else:

@@ -492,42 +492,47 @@ def _build_dag_levels(workflow) -> List[List]:
     return levels
 
 
-def parse_sub_resources(submit_dir: str) -> dict:
+def scan_sub_files(submit_dir: str) -> dict:
     """
-    Parse all HTCondor .sub files in *submit_dir* and extract per-job
-    resource requests.  Uses the ``+pegasus_wf_dax_job_id`` ClassAd to
-    key results back to workflow YAML job IDs.
+    Single-pass scan of all HTCondor .sub files in *submit_dir*.
+
+    For each file that belongs to a user job (has a non-null
+    ``+pegasus_wf_dax_job_id`` ClassAd) this extracts:
+
+    - ``request_cpus``    — CPUs requested in the .sub file
+    - ``request_memory_mb`` — memory requested in the .sub file (MB)
+    - ``sub_path``        — absolute path to the .sub file (for later patching)
+
+    Infrastructure jobs (stage-in, cleanup, create-dir, etc.) have
+    ``+pegasus_wf_dax_job_id = "null"`` and are skipped.
 
     Returns
     -------
     dict
-        ``{dax_job_id: {"request_cpus": int, "request_memory_mb": float}}``
-        Only jobs whose .sub file contains ``+pegasus_wf_dax_job_id`` are
-        included; infrastructure jobs (stage-in, cleanup, etc.) are skipped.
+        ``{dax_job_id: {"request_cpus": int|None,
+                        "request_memory_mb": float|None,
+                        "sub_path": str}}``
     """
-    resources = {}
+    result  = {}
     sub_dir = Path(submit_dir)
     if not sub_dir.is_dir():
-        return resources
+        return result
 
     for sub_path in sub_dir.glob("*.sub"):
-        dax_job_id   = None
-        req_cpus     = None
-        req_memory   = None
+        dax_job_id = None
+        req_cpus   = None
+        req_memory = None
         try:
             for line in sub_path.read_text().splitlines():
                 line = line.strip()
-                # +pegasus_wf_dax_job_id = "ID000001"
                 m = re.match(
                     r'\+pegasus_wf_dax_job_id\s*=\s*"?([^"\s]+)"?', line, re.IGNORECASE
                 )
                 if m and m.group(1).lower() != "null":
                     dax_job_id = m.group(1)
-                # request_cpus = 4
                 m = re.match(r'request_cpus\s*=\s*(\d+)', line, re.IGNORECASE)
                 if m:
                     req_cpus = int(m.group(1))
-                # request_memory = 8192
                 m = re.match(r'request_memory\s*=\s*([\d.]+)', line, re.IGNORECASE)
                 if m:
                     req_memory = float(m.group(1))
@@ -535,12 +540,85 @@ def parse_sub_resources(submit_dir: str) -> dict:
             continue
 
         if dax_job_id:
-            resources[dax_job_id] = {
-                "request_cpus":      req_cpus,     # None → keep YAML profile value
-                "request_memory_mb": req_memory,   # None → keep YAML profile value
+            result[dax_job_id] = {
+                "request_cpus":      req_cpus,
+                "request_memory_mb": req_memory,
+                "sub_path":          str(sub_path),
             }
 
-    return resources
+    return result
+
+
+# Keep old name as alias so existing code doesn't break
+def parse_sub_resources(submit_dir: str) -> dict:
+    """Alias for :func:`scan_sub_files` — returns resource dict only."""
+    return {
+        jid: {k: v for k, v in info.items() if k != "sub_path"}
+        for jid, info in scan_sub_files(submit_dir).items()
+    }
+
+
+def patch_sub_file(sub_path: str, prediction: dict) -> bool:
+    """
+    Inject predicted runtime ClassAds into a .sub file **in-place**.
+
+    Called after prediction, before DAGMan submits the job.  Adds:
+
+    - ``+PredictedRuntime``     — median predicted seconds
+    - ``+PredictedRuntimeLow``  — lower-bound seconds
+    - ``+PredictedRuntimeHigh`` — upper-bound seconds
+    - ``+PredictionStatus``     — NORMAL / SPARSE / ZERO_SHOT / RULE_BASED
+    - Updates ``periodic_remove`` to also kill jobs running > 3× upper bound
+      (safety net; keeps the existing held-job removal condition).
+
+    Returns True on success, False if the file could not be patched.
+    """
+    path = Path(sub_path)
+    if not path.is_file():
+        return False
+
+    predicted_s  = max(1, int(prediction.get("predicted_runtime_s", 0)))
+    upper_s      = max(predicted_s, int(prediction.get("upper_bound_s",  predicted_s * 2)))
+    lower_s      = max(0,           int(prediction.get("lower_bound_s",  0)))
+    status       = str(prediction.get("status", "UNKNOWN"))
+    # Kill if running longer than 3× upper bound (minimum 1 h)
+    timeout_s    = max(upper_s * 3, 3_600)
+
+    try:
+        lines     = path.read_text().splitlines()
+        new_lines = []
+        queue_line = None
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.lower().startswith("queue"):
+                queue_line = line
+                continue                            # re-appended after our ClassAds
+            if re.match(r'periodic_remove\s*=', stripped, re.IGNORECASE):
+                # Extend existing expression: also remove over-time running jobs
+                existing = line.split("=", 1)[1].strip()
+                line = (
+                    f"periodic_remove = ({existing}) || "
+                    f"((JobStatus == 2) && "
+                    f"((CurrentTime - EnteredCurrentStatus) > {timeout_s}))"
+                )
+            new_lines.append(line)
+
+        # Append our ClassAds before the queue statement
+        new_lines += [
+            f"+PredictedRuntime     = {predicted_s}",
+            f"+PredictedRuntimeLow  = {lower_s}",
+            f"+PredictedRuntimeHigh = {upper_s}",
+            f'+PredictionStatus     = "{status}"',
+        ]
+        if queue_line:
+            new_lines.append(queue_line)
+
+        path.write_text("\n".join(new_lines) + "\n")
+        return True
+
+    except OSError:
+        return False
 
 
 def find_submit_dir(workflow_yml: str) -> str | None:

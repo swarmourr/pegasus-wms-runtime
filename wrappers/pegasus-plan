@@ -202,45 +202,41 @@ def _register_jobs_in_db(dag_dir: Path, bd: dict, job_ids: list, sub_files: dict
         con = sqlite3.connect(db_path)
         cur = con.cursor()
 
-        # Get the wf_id for this run
-        wf_uuid = bd.get("wf_uuid", "")
-        print(f"[pegasus-plan] DB={db_path}  wf_uuid={wf_uuid!r}", flush=True)
-
-        # Show available tables for debugging
-        tables = [r[0] for r in cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-        print(f"[pegasus-plan] DB tables: {tables}", flush=True)
-
-        # Try workflow table first, then master_workflow
-        wf_id = None
-        for tbl in ("workflow", "master_workflow"):
-            if tbl in tables:
-                row = cur.execute(
-                    f"SELECT wf_id FROM {tbl} WHERE wf_uuid = ?", (wf_uuid,)
-                ).fetchone()
-                if row:
-                    wf_id = row[0]
-                    print(f"[pegasus-plan] Found wf_id={wf_id} in {tbl}", flush=True)
-                    break
-
-        if wf_id is None:
-            print(f"[pegasus-plan] wf_uuid not found in DB — cannot register jobs.", flush=True)
+        # Find the wf_id for this run by matching submit_dir (most recent match)
+        submit_dir = str(dag_dir)
+        row = cur.execute(
+            "SELECT wf_id FROM workflow WHERE submit_dir = ? ORDER BY wf_id DESC LIMIT 1",
+            (submit_dir,)
+        ).fetchone()
+        if not row:
+            # Fallback: pick the most recently inserted workflow
+            row = cur.execute(
+                "SELECT wf_id FROM workflow ORDER BY wf_id DESC LIMIT 1"
+            ).fetchone()
+        if not row:
+            print("[pegasus-plan] No workflow found in DB — cannot register jobs.", flush=True)
             con.close()
             return
+        wf_id = row[0]
 
-        # Insert one row per prediction job (ignore if already exists)
+        # Get job table columns to build a compatible INSERT
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(job)").fetchall()]
+
         for jid in job_ids:
-            cur.execute("""
-                INSERT OR IGNORE INTO job
-                    (wf_id, type_desc, clustered, max_retries,
-                     executable, argv, task_count, submit_file)
-                VALUES (?, 'auxillary', 0, 0, ?, ?, 1, ?)
-            """, (
-                wf_id,
-                sys.executable,
-                f"{_PREDICTOR} --level={jid.split('_L')[-1]}",
-                sub_files.get(jid, ""),
-            ))
+            level = jid.split("_L")[-1]
+            values = {"wf_id": wf_id, "type_desc": "auxillary", "clustered": 0,
+                      "max_retries": 0, "task_count": 1,
+                      "executable": sys.executable,
+                      "argv": f"{_PREDICTOR} --level={level}",
+                      "submit_file": sub_files.get(jid, ""),
+                      "job_name": jid}
+            row_cols = [c for c in cols if c in values]
+            placeholders = ",".join("?" * len(row_cols))
+            col_names = ",".join(row_cols)
+            cur.execute(
+                f"INSERT OR IGNORE INTO job ({col_names}) VALUES ({placeholders})",
+                [values[c] for c in row_cols],
+            )
         con.commit()
         con.close()
         print(f"[pegasus-plan] Registered {len(job_ids)} prediction job(s) in workflow DB.",

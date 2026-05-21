@@ -136,6 +136,21 @@ def _job_subdir(dag_dir: Path) -> Path:
     return dag_dir
 
 
+def _read_braindump(dag_dir: Path) -> dict:
+    """
+    Parse braindump.txt in the run directory to get workflow UUIDs and other
+    metadata that monitord needs to register jobs in the stampede database.
+    """
+    bd = dag_dir / "braindump.txt"
+    data = {}
+    if bd.exists():
+        for line in bd.read_text().splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                data[k.strip()] = v.strip()
+    return data
+
+
 def _create_pred_sub(dag_dir: Path, job_id: str, wf_yaml: str,
                      output_dir: str, level_idx: int) -> str:
     """Write an HTCondor submit file for a prediction job."""
@@ -145,6 +160,12 @@ def _create_pred_sub(dag_dir: Path, job_id: str, wf_yaml: str,
     log = sub_dir / f"{job_id}.log"
     out = sub_dir / f"{job_id}.out"
     err = sub_dir / f"{job_id}.err"
+
+    bd = _read_braindump(dag_dir)
+    wf_uuid      = bd.get("wf_uuid", "")
+    root_wf_uuid = bd.get("root_wf_uuid", wf_uuid)
+    submit_dir   = bd.get("submit_dir", str(dag_dir))
+
     sub.write_text(
         f"universe       = local\n"
         f"executable     = {sys.executable}\n"
@@ -155,6 +176,10 @@ def _create_pred_sub(dag_dir: Path, job_id: str, wf_yaml: str,
         f"should_transfer_files = NO\n"
         f"+pegasus_job_type = \"auxillary\"\n"
         f"+pegasus_wf_xformation = \"pegasus::runtime-predictor\"\n"
+        f"+pegasus_wf_dax_job_id = \"{job_id}\"\n"
+        f"+pegasus_wf_uuid = \"{wf_uuid}\"\n"
+        f"+pegasus_root_wf_uuid = \"{root_wf_uuid}\"\n"
+        f"+pegasus_wf_submit_dir = \"{submit_dir}\"\n"
         f"queue\n"
     )
     return str(sub)

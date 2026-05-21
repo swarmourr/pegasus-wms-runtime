@@ -585,36 +585,45 @@ def patch_sub_file(sub_path: str, prediction: dict) -> bool:
     timeout_s    = max(upper_s * 3, 3_600)
 
     try:
-        lines     = path.read_text().splitlines()
-        new_lines = []
+        lines      = path.read_text().splitlines()
+        body_lines = []   # classads and directives
+        tail_lines = []   # comment block + queue — kept at the very end
+
+        in_tail = False
         queue_line = None
 
         for line in lines:
             stripped = line.strip()
-            if stripped.lower().startswith("queue"):
+            # Everything from the first "queue" line onward is the tail
+            if not in_tail and stripped.lower().startswith("queue"):
+                in_tail    = True
                 queue_line = line
-                continue                            # re-appended after our ClassAds
+                continue
+            if in_tail:
+                tail_lines.append(line)
+                continue
+            # Extend periodic_remove to also kill over-time running jobs
             if re.match(r'periodic_remove\s*=', stripped, re.IGNORECASE):
-                # Extend existing expression: also remove over-time running jobs
                 existing = line.split("=", 1)[1].strip()
                 line = (
                     f"periodic_remove = ({existing}) || "
                     f"((JobStatus == 2) && "
                     f"((CurrentTime - EnteredCurrentStatus) > {timeout_s}))"
                 )
-            new_lines.append(line)
+            body_lines.append(line)
 
-        # Append our ClassAds before the queue statement
-        new_lines += [
+        # Insert our ClassAds at the end of the body, before queue + tail
+        body_lines += [
             f"+PredictedRuntime     = {predicted_s}",
             f"+PredictedRuntimeLow  = {lower_s}",
             f"+PredictedRuntimeHigh = {upper_s}",
             f'+PredictionStatus     = "{status}"',
         ]
         if queue_line:
-            new_lines.append(queue_line)
+            body_lines.append(queue_line)
+        body_lines += tail_lines
 
-        path.write_text("\n".join(new_lines) + "\n")
+        path.write_text("\n".join(body_lines) + "\n")
         return True
 
     except OSError:

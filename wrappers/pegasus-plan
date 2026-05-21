@@ -138,18 +138,28 @@ def _job_subdir(dag_dir: Path) -> Path:
 
 def _read_braindump(dag_dir: Path) -> dict:
     """
-    Parse braindump.txt (key: value YAML or key = value) from the run dir.
+    Parse braindump.txt from the run directory.
+    Pegasus 5.x writes it as YAML; older versions use key = value.
     """
     bd = dag_dir / "braindump.txt"
-    data = {}
     if not bd.exists():
-        return data
-    for line in bd.read_text().splitlines():
+        return {}
+    text = bd.read_text()
+    # Try YAML first (Pegasus 5.x)
+    try:
+        import yaml as _yaml
+        data = _yaml.safe_load(text)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if v is not None}
+    except Exception:
+        pass
+    # Fallback: key = value or key: value
+    data = {}
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # YAML style "key: value" or legacy "key = value"
-        for sep in (":", "="):
+        for sep in ("=", ":"):
             if sep in line:
                 k, _, v = line.partition(sep)
                 data[k.strip()] = v.strip().strip('"').strip("'")
@@ -164,22 +174,29 @@ def _register_jobs_in_db(dag_dir: Path, bd: dict, job_ids: list, sub_files: dict
     """
     import sqlite3, glob as _glob
 
-    # Find the per-run workflow DB (not the replicas DB)
-    db_url = bd.get("db_url", bd.get("pegasus_wf_url", ""))
+    # Locate the workflow DB — try several sources in order
     db_path = ""
-    if db_url:
-        # strip "sqlite:///" prefix
-        db_path = re.sub(r"^sqlite:///", "", db_url)
 
+    # 1. braindump db_url field
+    db_url = bd.get("db_url", bd.get("pegasus_wf_url", ""))
+    if db_url:
+        db_path = re.sub(r"^(sqlite:///?|jdbc:sqlite:/?)", "", db_url)
+
+    # 2. Any .db in dag_dir that is not replicas.db
     if not db_path or not Path(db_path).exists():
-        # Fallback: find any .db in dag_dir that is not replicas.db
-        candidates = [p for p in dag_dir.glob("*.db")
-                      if "replicas" not in p.name and "workflow" not in p.name.lower()]
+        candidates = [p for p in dag_dir.glob("*.db") if "replicas" not in p.name]
         if candidates:
             db_path = str(candidates[0])
 
+    # 3. Master Pegasus workflow DB at ~/.pegasus/workflow.db
     if not db_path or not Path(db_path).exists():
-        return  # cannot locate DB — skip silently
+        master = Path.home() / ".pegasus" / "workflow.db"
+        if master.exists():
+            db_path = str(master)
+
+    if not db_path or not Path(db_path).exists():
+        print("[pegasus-plan] Could not locate workflow DB — skipping DB registration.", flush=True)
+        return
 
     try:
         con = sqlite3.connect(db_path)

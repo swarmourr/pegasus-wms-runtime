@@ -429,13 +429,43 @@ class ModelContext:
             df["transformation"] = df["transformation"].apply(self._resolve_name)
         df_eng, name_emb = _make_features(df, self.arts)
         X = self.scaler.transform(_assemble_X(df_eng, name_emb, self.numeric_cols))
+        Xt = torch.FloatTensor(X).to(self.device)
         with torch.no_grad():
-            (pm, pl, ph), _, _, _ = self.model(
-                torch.FloatTensor(X).to(self.device))
+            (pm, pl, ph), recon, mu, lv = self.model(Xt)
 
         p_med  = np.expm1(pm.cpu().numpy().flatten())
         p_low  = np.clip(np.expm1(pl.cpu().numpy().flatten()), 0, None)
         p_high = np.expm1(ph.cpu().numpy().flatten())
+
+        # ── VAE interpretation ─────────────────────────────────────────────
+        # Reconstruction error: per-job MSE between input and VAE output.
+        # High error = job features are far from anything seen in training.
+        recon_err = ((Xt - recon) ** 2).mean(dim=1).cpu().numpy()          # shape (N,)
+
+        # KL divergence from the standard normal prior (per job, summed over latent dims).
+        # High KL = the job's latent encoding is unusual compared to training.
+        kl = (0.5 * (mu ** 2 + lv.exp() - lv - 1).sum(dim=1)).cpu().numpy()
+
+        # Anomaly score: weighted combination of reconstruction error and KL.
+        # Scaled to [0, 1] via a sigmoid-like transform so it is human-readable.
+        raw_anomaly = recon_err + 0.1 * kl
+        anomaly_score = 1.0 / (1.0 + np.exp(-2.0 * (raw_anomaly - raw_anomaly.mean()
+                                                       ) / (raw_anomaly.std() + 1e-8)))
+
+        # Confidence: 1 - anomaly, clipped to [0, 1].
+        vae_confidence = np.clip(1.0 - anomaly_score, 0.0, 1.0)
+
+        # Latent mu vectors (8 dims per job) — represent job "type" in latent space.
+        latent_mu = mu.cpu().numpy()  # shape (N, lat_dim)
+
+        # Widen the prediction interval for high-anomaly jobs: the model is
+        # less reliable when the job is far from the training distribution.
+        # Interval is stretched by up to 2x when anomaly_score approaches 1.
+        interval_scale = 1.0 + anomaly_score          # 1.0 (normal) … 2.0 (very anomalous)
+        p_mid   = (p_low + p_high) / 2.0
+        half    = (p_high - p_low) / 2.0
+        p_low   = np.maximum(0, p_mid - half * interval_scale)
+        p_high  = p_mid + half * interval_scale
 
         # transformation column was already resolved by _resolve_name above;
         # re-resolve here only to determine the status label per row.
@@ -460,7 +490,7 @@ class ModelContext:
             else:
                 statuses.append("NORMAL")
 
-        return p_med, p_low, p_high, statuses
+        return p_med, p_low, p_high, statuses, anomaly_score, vae_confidence, latent_mu
 
 
 # ─────────────────────────────────────────────
@@ -971,8 +1001,9 @@ class WorkflowRuntimePredictor:
         if df.empty:
             return []
 
-        # ── Step 3: single batch forward pass ─────────────────────────────
-        p_med, p_low, p_high, statuses = self._ctx.predict(df)
+        # ── Step 3: single batch forward pass + VAE interpretation ───────────
+        p_med, p_low, p_high, statuses, anomaly, confidence, latent_mu = \
+            self._ctx.predict(df)
         ip_pct = int(round((self._ctx.q_hi - self._ctx.q_lo) * 100))
 
         # ── Step 4: assemble result rows ───────────────────────────────────
@@ -993,6 +1024,10 @@ class WorkflowRuntimePredictor:
                 "input_bytes_total":   float(row.input_bytes_total),
                 "cpu_count":           int(row.cpu_count),
                 "hostname":            row.hostname,
+                # VAE interpretation
+                "vae_anomaly_score":   round(float(anomaly[i]),    4),
+                "vae_confidence":      round(float(confidence[i]), 4),
+                "vae_latent_mu":       [round(float(v), 4) for v in latent_mu[i]],
             })
 
         # ── Step 5: write CSV ──────────────────────────────────────────────

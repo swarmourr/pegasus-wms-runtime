@@ -585,45 +585,38 @@ def patch_sub_file(sub_path: str, prediction: dict) -> bool:
     timeout_s    = max(upper_s * 3, 3_600)
 
     try:
-        lines      = path.read_text().splitlines()
-        body_lines = []   # classads and directives
-        tail_lines = []   # comment block + queue — kept at the very end
+        lines = path.read_text().splitlines()
 
-        in_tail = False
-        queue_line = None
+        # Find the queue line (always present in Pegasus .sub files)
+        queue_idx = next(
+            (i for i, l in enumerate(lines) if l.strip().lower().startswith("queue")),
+            None,
+        )
+        if queue_idx is None:
+            return False
 
-        for line in lines:
-            stripped = line.strip()
-            # Everything from the first "queue" line onward is the tail
-            if not in_tail and stripped.lower().startswith("queue"):
-                in_tail    = True
-                queue_line = line
-                continue
-            if in_tail:
-                tail_lines.append(line)
-                continue
-            # Extend periodic_remove to also kill over-time running jobs
-            if re.match(r'periodic_remove\s*=', stripped, re.IGNORECASE):
+        # Update periodic_remove in the block before queue
+        before = []
+        for line in lines[:queue_idx]:
+            if re.match(r'periodic_remove\s*=', line.strip(), re.IGNORECASE):
                 existing = line.split("=", 1)[1].strip()
                 line = (
                     f"periodic_remove = ({existing}) || "
                     f"((JobStatus == 2) && "
                     f"((CurrentTime - EnteredCurrentStatus) > {timeout_s}))"
                 )
-            body_lines.append(line)
+            before.append(line)
 
-        # Insert our ClassAds at the end of the body, before queue + tail
-        body_lines += [
+        our_ads = [
             f"+PredictedRuntime     = {predicted_s}",
             f"+PredictedRuntimeLow  = {lower_s}",
             f"+PredictedRuntimeHigh = {upper_s}",
             f'+PredictionStatus     = "{status}"',
         ]
-        if queue_line:
-            body_lines.append(queue_line)
-        body_lines += tail_lines
 
-        path.write_text("\n".join(body_lines) + "\n")
+        # Result: classads → our ads → queue → comment block (original tail)
+        result = before + our_ads + lines[queue_idx:]
+        path.write_text("\n".join(result) + "\n")
         return True
 
     except OSError:

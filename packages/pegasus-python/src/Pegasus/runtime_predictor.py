@@ -215,11 +215,22 @@ def _synth(j):
 
 
 def _site(h):
+    """
+    Map a hostname or Pegasus site name to the integer encoding used during training.
+    0=ISI, 1=WSU/Hellbender, 2=Anvil/Purdue, 3=Stampede/TACC, 4=Expanse/SDSC, 5=other.
+    Extended to cover dominant hostname patterns in the training data.
+    """
     h = str(h).lower()
-    for k, v in [("isi", 0), ("wsu", 1), ("anvil", 2), ("stampede", 3), ("expanse", 4)]:
+    for k, v in [
+        ("isi",        0),
+        ("wsu",        1), ("hellbender",  1), ("wustl",      1),
+        ("anvil",      2), ("purdue",      2),
+        ("stampede",   3), ("tacc",        3), ("frontera",   3),
+        ("expanse",    4), ("sdsc",        4),
+    ]:
         if k in h:
             return v
-    return 5
+    return 5  # OSG / unknown — largest bucket in training (73 % of rows)
 
 
 def _bytes_bin(b):
@@ -271,7 +282,10 @@ def _make_features(df: pd.DataFrame, a: dict):
     df["compute_intensity"]     = (df.get("input_bytes_total", 0) /
                                    (df["cpu_power"] + 1e-6))
     df["log_compute_intensity"] = np.log1p(df["compute_intensity"])
-    df["memory_pressure"]       = df.get("ram", 0) / (df.get("cpu_count", 1) + 1e-6)
+    # memory_pressure uses request_cpus (what the job asked for) so it reflects
+    # the per-CPU memory allocation, not the machine total.
+    req_cpus_col = df["request_cpus"] if "request_cpus" in df.columns else df.get("cpu_count", 1)
+    df["memory_pressure"]       = df.get("ram", 0) / (req_cpus_col + 1e-6)
     df["site_encoded"]          = (df["hostname"].apply(_site)
                                    if "hostname" in df.columns else 0)
     df["log_input_files_count"] = np.log1p(df.get("input_files_count", 0))
@@ -370,7 +384,49 @@ class ModelContext:
         self.trans_counts = self.arts.get("trans_counts", {})
         self.smart_rule   = self.arts.get("smart_rule", {})
 
+        # Reverse lookup: bare name (no ns:: or :version) → best canonical name.
+        # "best" = highest training sample count when multiple canonical names
+        # share the same bare name (e.g. "diamond::findrange:4.0" and
+        # "pegasus::findrange:4.0" both strip to "findrange").
+        # Built once at load time so _resolve() is O(1) per job.
+        self._bare_to_canonical: dict = {}
+        for cname in self.known_trans:
+            bare = re.sub(r":[^:]+$", "", re.sub(r"^[^:]+::", "", cname))
+            if (bare not in self._bare_to_canonical or
+                    self.trans_counts.get(cname, 0) >
+                    self.trans_counts.get(self._bare_to_canonical[bare], 0)):
+                self._bare_to_canonical[bare] = cname
+
+    def _resolve_name(self, t: str) -> str:
+        """
+        Resolve a raw transformation name to its canonical training-data name.
+        Four-step lookup (each step only runs if the previous one misses):
+          1. Exact match in known_trans / rule_map / smart_rule
+          2. Strip namespace prefix  e.g. "diamond::findrange:4.0" → "findrange:4.0"
+          3. Strip version suffix    e.g. "findrange:4.0" → "findrange"
+          4. Reverse bare-name map   e.g. "preprocess" → "diamond::preprocess:4.0"
+        Returns the original name unchanged if nothing matches (ZERO_SHOT).
+        """
+        if t in self.known_trans or t in self.rule_map or t in self.smart_rule:
+            return t
+        base = re.sub(r"^[^:]+::", "", t)
+        if base in self.known_trans or base in self.rule_map or base in self.smart_rule:
+            return base
+        base2 = re.sub(r":[^:]+$", "", base)
+        if base2 in self.known_trans or base2 in self.rule_map or base2 in self.smart_rule:
+            return base2
+        bare = re.sub(r":[^:]+$", "", re.sub(r"^[^:]+::", "", t))
+        canonical = self._bare_to_canonical.get(bare)
+        if canonical:
+            return canonical
+        return t
+
     def predict(self, df: pd.DataFrame):
+        # Resolve transformation names to canonical training names before feature
+        # engineering so that anchor_runtime and name embeddings both benefit.
+        if "transformation" in df.columns:
+            df = df.copy()
+            df["transformation"] = df["transformation"].apply(self._resolve_name)
         df_eng, name_emb = _make_features(df, self.arts)
         X = self.scaler.transform(_assemble_X(df_eng, name_emb, self.numeric_cols))
         with torch.no_grad():
@@ -381,27 +437,11 @@ class ModelContext:
         p_low  = np.clip(np.expm1(pl.cpu().numpy().flatten()), 0, None)
         p_high = np.expm1(ph.cpu().numpy().flatten())
 
+        # transformation column was already resolved by _resolve_name above;
+        # re-resolve here only to determine the status label per row.
         statuses = []
         for i, row in enumerate(df.itertuples(index=False)):
             trans = getattr(row, "transformation", "")
-
-            # Resolve the canonical name: try exact match first, then
-            # strip namespace (ns::name) and version (name:ver) variants
-            # so training-data names always match workflow YAML names.
-            def _resolve(t):
-                if t in self.known_trans or t in self.rule_map or t in self.smart_rule:
-                    return t
-                # strip namespace prefix  e.g. "pegasus::transfer" → "transfer"
-                base = re.sub(r"^[^:]+::", "", t)
-                if base in self.known_trans or base in self.rule_map or base in self.smart_rule:
-                    return base
-                # strip version suffix  e.g. "transfer:4.0" → "transfer"
-                base2 = re.sub(r":[^:]+$", "", base)
-                if base2 in self.known_trans or base2 in self.rule_map or base2 in self.smart_rule:
-                    return base2
-                return t  # unchanged — will be ZERO_SHOT
-
-            trans   = _resolve(trans)
             n_train = self.trans_counts.get(trans, 0)
             if trans in self.rule_map:
                 rv        = self.rule_map[trans]
@@ -426,6 +466,21 @@ class ModelContext:
 # ─────────────────────────────────────────────
 # 5. FEATURE EXTRACTION FROM WORKFLOW OBJECT
 # ─────────────────────────────────────────────
+
+def _job_execution_site(job) -> Optional[str]:
+    """
+    Extract the execution site name from a job's profiles.
+    Checks selector.execution.site and pegasus.execution.site in that order.
+    Returns None if not set — caller falls back to slot hostname.
+    """
+    for ns_key, profs in job.profiles.items():
+        ns_val = ns_key.value if hasattr(ns_key, "value") else str(ns_key)
+        if ns_val in ("selector", "pegasus"):
+            for k, v in (profs.items() if hasattr(profs, "items") else profs):
+                if str(k).lower() in ("execution.site", "executionsite"):
+                    return str(v)
+    return None
+
 
 def _condor_profiles(job) -> dict:
     """Return the Condor-namespace profile dict from a job, key-agnostic."""
@@ -721,10 +776,15 @@ def _extract_features(
         using the output_ratio per transformation stored in arts, so middle
         jobs get a realistic input_bytes_total instead of 0
 
-    ``sub_resources`` (optional) overrides cpu_count and ram with actual
-    ``request_cpus`` / ``request_memory`` values parsed from HTCondor .sub files,
-    keyed by DAX job ID.  This closes the gap between training-time features
-    (read from .sub files) and prediction-time features (read from YAML profiles).
+    ``sub_resources`` (optional) provides request_cpus / request_memory from
+    HTCondor .sub files, keyed by DAX job ID.
+
+    cpu_count semantics: the training data records the actual machine's CPU count
+    from kickstart output (e.g. a 64-CPU node shows cpu_count=64 regardless of
+    how many CPUs the job requested).  We therefore always use slot["cpu_count"]
+    (the machine total from condor_status) for the model's cpu_count feature.
+    request_cpus is only used to derive memory_pressure (ram / request_cpus),
+    which captures the per-CPU memory allocation requested by the job.
 
     SubWorkflow and Pegasus/system auxiliary jobs are skipped at every level.
     """
@@ -753,20 +813,27 @@ def _extract_features(
             if ns in ("pegasus", "system"):
                 continue  # aux job
 
-            # ── Resource resolution: .sub file > YAML profile > slot default ──
             condor  = _condor_profiles(job)
             sub_res = sub_resources.get(jid, {})
 
+            # cpu_count: always the machine total (matches training-time kickstart data)
+            machine_cpus = slot["cpu_count"]
+
+            # request_cpus: what the job asked for (used for memory_pressure only)
             req_cpus = (
-                sub_res.get("request_cpus")                        # .sub file (most accurate)
-                or int(condor.get("request_cpus", 0))              # YAML condor profile
-                or slot["cpu_count"]                                # slot default
+                sub_res.get("request_cpus")
+                or int(condor.get("request_cpus", 0))
+                or machine_cpus
             )
+
             req_mem_mb = (
-                sub_res.get("request_memory_mb")                   # .sub file (most accurate)
-                or float(condor.get("request_memory", 0))          # YAML condor profile
+                sub_res.get("request_memory_mb")
+                or float(condor.get("request_memory", 0))
             )
             ram_kb = req_mem_mb * 1_024 if req_mem_mb > 0 else slot["ram"]
+
+            # site: prefer named execution site from job profiles over hostname
+            exec_site = _job_execution_site(job) or slot["hostname"]
 
             inputs            = job.get_inputs() if hasattr(job, "get_inputs") else []
             input_files_count = len(inputs)
@@ -778,12 +845,13 @@ def _extract_features(
                 "job_id":            jid,
                 "transformation":    _full_trans_name(job),
                 "dag_level":         level_idx,
-                "cpu_count":         req_cpus,
+                "cpu_count":         machine_cpus,
+                "request_cpus":      req_cpus,
                 "cpu_speed":         slot["cpu_speed"],
                 "ram":               ram_kb,
                 "input_bytes_total": float(input_bytes_total),
                 "input_files_count": input_files_count,
-                "hostname":          slot["hostname"],
+                "hostname":          exec_site,
             })
             level_map[jid] = level_idx
 

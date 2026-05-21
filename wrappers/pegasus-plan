@@ -112,7 +112,9 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
         wf = yaml.safe_load(f)
 
     jobs  = wf.get("jobs", [])
-    deps  = wf.get("dependencies", [])
+    # Pegasus 5.x YAML uses "jobDependencies"; older versions use "dependencies"
+    deps_key = "jobDependencies" if "jobDependencies" in wf else "dependencies"
+    deps  = wf.get(deps_key, [])
     levels = _topo_levels(jobs, deps)
     if not levels:
         return None
@@ -165,7 +167,7 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
                 for pid, cids in dep_map.items() if cids]
 
     wf["jobs"] = jobs + new_jobs
-    wf["dependencies"] = new_deps
+    wf[deps_key] = new_deps
 
     # ── Add TC entry for pegasus-runtime-predictor ────────────────────────
     tc = wf.get("transformationCatalog", {})

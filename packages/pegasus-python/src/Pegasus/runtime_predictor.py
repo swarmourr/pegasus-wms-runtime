@@ -438,30 +438,61 @@ class ModelContext:
         p_high = np.expm1(ph.cpu().numpy().flatten())
 
         # ── VAE interpretation ─────────────────────────────────────────────
-        # Reconstruction error: per-job MSE between input and VAE output.
-        # High error = job features are far from anything seen in training.
-        recon_err = ((Xt - recon) ** 2).mean(dim=1).cpu().numpy()          # shape (N,)
+        # Per-feature squared reconstruction error: shape (N, input_dim).
+        # Tells us WHICH feature is most responsible for the anomaly.
+        per_feat_err = ((Xt - recon) ** 2).cpu().numpy()   # (N, input_dim)
+        recon_err    = per_feat_err.mean(axis=1)            # (N,) — overall error
 
-        # KL divergence from the standard normal prior (per job, summed over latent dims).
-        # High KL = the job's latent encoding is unusual compared to training.
+        # KL divergence per job — how unusual is the latent encoding.
         kl = (0.5 * (mu ** 2 + lv.exp() - lv - 1).sum(dim=1)).cpu().numpy()
 
-        # Anomaly score: weighted combination of reconstruction error and KL.
-        # Scaled to [0, 1] via a sigmoid-like transform so it is human-readable.
-        raw_anomaly = recon_err + 0.1 * kl
+        # Anomaly score [0,1]: sigmoid-normalised combination of recon error + KL.
+        raw_anomaly   = recon_err + 0.1 * kl
         anomaly_score = 1.0 / (1.0 + np.exp(-2.0 * (raw_anomaly - raw_anomaly.mean()
                                                        ) / (raw_anomaly.std() + 1e-8)))
 
-        # Confidence: 1 - anomaly, clipped to [0, 1].
         vae_confidence = np.clip(1.0 - anomaly_score, 0.0, 1.0)
+        latent_mu      = mu.cpu().numpy()   # (N, lat_dim)
 
-        # Latent mu vectors (8 dims per job) — represent job "type" in latent space.
-        latent_mu = mu.cpu().numpy()  # shape (N, lat_dim)
+        # ── Anomaly type: which feature group drives the reconstruction error ──
+        # Map feature index → human-readable anomaly category.
+        # Indices 0-8 = numeric_cols; indices 9+ = name-embedding dims.
+        _FEAT_TYPE = {
+            0: "unknown_transformation",   # log_anchor_runtime  — no training history
+            1: "unusual_cpu",              # log_cpu_power
+            2: "unusual_memory",           # log_ram
+            3: "unusual_data_size",        # log_input_bytes
+            4: "unusual_io_pattern",       # log_io_intensity
+            5: "unusual_compute_pattern",  # log_compute_intensity
+            6: "unusual_memory_cpu_ratio", # memory_pressure
+            7: "unusual_site",             # site_encoded
+            8: "unusual_file_count",       # log_input_files_count
+        }
+        _NAME_EMB_TYPE = "unknown_transformation_name"  # dims 9+ = TF-IDF name embedding
 
-        # Widen the prediction interval for high-anomaly jobs: the model is
-        # less reliable when the job is far from the training distribution.
-        # Interval is stretched by up to 2x when anomaly_score approaches 1.
-        interval_scale = 1.0 + anomaly_score          # 1.0 (normal) … 2.0 (very anomalous)
+        def _anomaly_types(feat_errors: np.ndarray) -> list:
+            """
+            Return a sorted list of (anomaly_type, contribution_pct) for the
+            top contributing feature groups, highest first.
+            Only groups contributing > 5 % of total error are included.
+            """
+            total = feat_errors.sum() + 1e-12
+            # Group name-embedding dims (9+) as one bucket
+            scores: dict = {}
+            for idx, err in enumerate(feat_errors):
+                key = _FEAT_TYPE.get(idx, _NAME_EMB_TYPE)
+                scores[key] = scores.get(key, 0.0) + err
+            ranked = sorted(scores.items(), key=lambda x: -x[1])
+            return [
+                {"type": k, "contribution_pct": round(float(100.0 * v / total), 1)}
+                for k, v in ranked
+                if v / total > 0.05
+            ]
+
+        anomaly_types = [_anomaly_types(per_feat_err[i]) for i in range(len(per_feat_err))]
+
+        # Widen the prediction interval for high-anomaly jobs (up to 2×).
+        interval_scale = 1.0 + anomaly_score
         p_mid   = (p_low + p_high) / 2.0
         half    = (p_high - p_low) / 2.0
         p_low   = np.maximum(0, p_mid - half * interval_scale)
@@ -490,7 +521,7 @@ class ModelContext:
             else:
                 statuses.append("NORMAL")
 
-        return p_med, p_low, p_high, statuses, anomaly_score, vae_confidence, latent_mu
+        return p_med, p_low, p_high, statuses, anomaly_score, vae_confidence, latent_mu, anomaly_types
 
 
 # ─────────────────────────────────────────────
@@ -1002,7 +1033,7 @@ class WorkflowRuntimePredictor:
             return []
 
         # ── Step 3: single batch forward pass + VAE interpretation ───────────
-        p_med, p_low, p_high, statuses, anomaly, confidence, latent_mu = \
+        p_med, p_low, p_high, statuses, anomaly, confidence, latent_mu, anomaly_types = \
             self._ctx.predict(df)
         ip_pct = int(round((self._ctx.q_hi - self._ctx.q_lo) * 100))
 
@@ -1027,6 +1058,7 @@ class WorkflowRuntimePredictor:
                 # VAE interpretation
                 "vae_anomaly_score":   round(float(anomaly[i]),    4),
                 "vae_confidence":      round(float(confidence[i]), 4),
+                "vae_anomaly_types":   anomaly_types[i],
                 "vae_latent_mu":       [round(float(v), 4) for v in latent_mu[i]],
             })
 

@@ -518,7 +518,7 @@ def scan_sub_files(submit_dir: str) -> dict:
     if not sub_dir.is_dir():
         return result
 
-    for sub_path in sub_dir.glob("*.sub"):
+    for sub_path in sub_dir.rglob("*.sub"):  # recursive — finds jobs in 00/00/
         dax_job_id = None
         req_cpus   = None
         req_memory = None
@@ -623,38 +623,44 @@ def patch_sub_file(sub_path: str, prediction: dict) -> bool:
 
 def find_submit_dir(workflow_yml: str) -> str | None:
     """
-    Locate the HTCondor submit directory that contains the .sub files for
-    this workflow run.  Tries three strategies in order:
+    Locate the Pegasus submit ROOT directory for this workflow run.
+    Returns the directory that contains ``braindump.yml`` so that
+    ``scan_sub_files`` can recurse into ``00/00/`` from there.
 
-    1. Current working directory (local-universe jobs run there).
-    2. ``braindump.yml`` discovered by walking up from *workflow_yml*.
-    3. A ``submit/`` subtree under the workflow directory.
-
-    Returns the directory path (str) or None if not found.
+    Tries in order:
+    1. ``$PEGASUS_SUBMIT_DIR`` / ``$_PEGASUS_SUBMIT_DIR`` env vars.
+    2. Walk up from CWD looking for ``braindump.yml``.
+    3. Search for ``braindump.yml`` under the workflow YAML directory.
+    4. ``submit/`` subtree under the workflow YAML directory.
     """
-    # 1. CWD — when running as universe=local the job runs in the submit dir
-    cwd = Path.cwd()
-    if list(cwd.glob("*.sub")):
-        return str(cwd)
+    # 1. Pegasus environment variable set at job launch
+    for var in ("PEGASUS_SUBMIT_DIR", "_PEGASUS_SUBMIT_DIR"):
+        sd = os.environ.get(var)
+        if sd and Path(sd).is_dir():
+            return sd
 
-    # 2. braindump.yml search
+    # 2. Walk up from CWD — local-universe jobs often run inside the submit tree
+    for candidate in [Path.cwd()] + list(Path.cwd().parents)[:8]:
+        if (candidate / "braindump.yml").is_file():
+            return str(candidate)
+
+    # 3. Search under workflow YAML directory
     wf_dir = Path(workflow_yml).resolve().parent
-    for search_root in [wf_dir] + list(wf_dir.parents)[:3]:
+    for search_root in [wf_dir] + list(wf_dir.parents)[:2]:
         for braindump in search_root.rglob("braindump.yml"):
             try:
                 import yaml as _yaml
                 data = _yaml.safe_load(braindump.read_text())
-                sd = data.get("submit_dir")
-                if sd:
-                    # look for *.sub files recursively under submit_dir
-                    for sub_file in Path(sd).rglob("*.sub"):
-                        return str(sub_file.parent)
+                sd = data.get("submit_dir") or str(braindump.parent)
+                if Path(sd).is_dir():
+                    return sd
             except Exception:
-                continue
+                return str(braindump.parent)
 
-    # 3. submit/ subtree under workflow dir
-    for candidate in (wf_dir / "submit").rglob("*.sub") if (wf_dir / "submit").is_dir() else []:
-        return str(candidate.parent)
+    # 4. submit/ subtree under workflow dir
+    submit_sub = wf_dir / "submit"
+    if submit_sub.is_dir():
+        return str(submit_sub)
 
     return None
 

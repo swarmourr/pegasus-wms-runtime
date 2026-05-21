@@ -144,10 +144,51 @@ def _create_pred_sub(dag_dir: Path, job_id: str, wf_yaml: str,
     return str(sub)
 
 
+def _patch_dot_file(dag_dir: Path, levels: list, all_job_ids: set):
+    """
+    Add prediction job nodes and edges to the concrete .dot file so they
+    appear in the Graphviz visualization alongside stage-in/cleanup jobs.
+    """
+    dot_files = list(dag_dir.glob("*.dot"))
+    if not dot_files:
+        return
+    dot_path = dot_files[0]
+    dot_text = dot_path.read_text()
+
+    # Insert before the closing brace of the digraph
+    insert_lines = ["\n  // Runtime Prediction Jobs"]
+    prev_level_jobs = None
+
+    for lvl_idx, level_jobs in enumerate(levels):
+        pred_id = f"pegasus_runtime_pred_L{lvl_idx}"
+        # Node styled like Pegasus auxiliary jobs (blue, filled)
+        insert_lines.append(
+            f'  "{pred_id}" [label="runtime-predictor\\nL{lvl_idx}",'
+            f' shape=ellipse, style=filled, fillcolor=lightblue,'
+            f' color=blue, fontsize=10];'
+        )
+        # pred → user jobs at this level
+        for jid in level_jobs:
+            if jid in all_job_ids:
+                insert_lines.append(f'  "{pred_id}" -> "{jid}";')
+        # previous level user jobs → pred
+        if prev_level_jobs:
+            for jid in prev_level_jobs:
+                if jid in all_job_ids:
+                    insert_lines.append(f'  "{jid}" -> "{pred_id}";')
+        prev_level_jobs = level_jobs
+
+    new_dot = dot_text.rstrip()
+    if new_dot.endswith("}"):
+        new_dot = new_dot[:-1] + "\n".join(insert_lines) + "\n}\n"
+        dot_path.write_text(new_dot)
+
+
 def _inject_prediction_jobs(dag_path: str, wf_yaml: str, output_dir: str):
     """
     Append pegasus-runtime-predictor jobs to the concrete .dag file.
     One job per user-job level, wired exactly like stage-in/cleanup nodes.
+    Also patches the .dot visualization file so jobs appear in Graphviz.
     """
     with open(dag_path) as f:
         dag_text = f.read()
@@ -162,12 +203,16 @@ def _inject_prediction_jobs(dag_path: str, wf_yaml: str, output_dir: str):
     if not levels:
         return
 
+    # All user job IDs for dot patching
+    all_job_ids = {jid for level in levels for jid in level}
+
     job_lines = []
     dep_lines = []
-    prev_level_jobs = None   # user job IDs at the previous level
+    prev_level_jobs = None
 
     for lvl_idx, level_jobs in enumerate(levels):
         pred_id  = f"pegasus_runtime_pred_L{lvl_idx}"
+        # Output goes inside the run directory alongside other Pegasus artifacts
         sub_file = _create_pred_sub(dag_dir, pred_id, wf_yaml, output_dir, lvl_idx)
 
         job_lines.append(f"JOB {pred_id} {sub_file}")
@@ -176,8 +221,7 @@ def _inject_prediction_jobs(dag_path: str, wf_yaml: str, output_dir: str):
         for jid in level_jobs:
             dep_lines.append(f"PARENT {pred_id} CHILD {jid}")
 
-        # pred-LN must wait for ALL user jobs at level N-1 to finish
-        # (so it can read actual output file sizes from disk)
+        # pred-LN waits for ALL user jobs at level N-1 to finish
         if prev_level_jobs:
             for jid in prev_level_jobs:
                 dep_lines.append(f"PARENT {jid} CHILD {pred_id}")
@@ -190,6 +234,9 @@ def _inject_prediction_jobs(dag_path: str, wf_yaml: str, output_dir: str):
             f.write(line + "\n")
         for line in dep_lines:
             f.write(line + "\n")
+
+    # Patch the Graphviz .dot file so prediction jobs are visible
+    _patch_dot_file(dag_dir, levels, all_job_ids)
 
     print(
         f"[pegasus-plan] Injected {len(levels)} runtime prediction job(s) into DAG.",
@@ -214,16 +261,13 @@ result  = subprocess.run(
 # Stream output to user
 print(result.stdout, end="", flush=True)
 
-print(f"[pegasus-plan] wf_yaml={wf_yaml!r}  returncode={result.returncode}", flush=True)
 if result.returncode == 0 and wf_yaml:
     dag_path = _find_dag_file(result.stdout)
-    print(f"[pegasus-plan] dag_path={dag_path!r}", flush=True)
     if dag_path:
-        output_dir = str(Path(wf_yaml).parent / "output")
+        # Output lives inside the run directory, next to other Pegasus artifacts
+        output_dir = str(Path(dag_path).parent)
         _inject_prediction_jobs(dag_path, wf_yaml, output_dir)
     else:
         print("[pegasus-plan] Could not locate .dag file — prediction not injected.", flush=True)
-elif result.returncode == 0 and not wf_yaml:
-    print("[pegasus-plan] No workflow YAML found in args — skipping injection.", flush=True)
 
 sys.exit(result.returncode)

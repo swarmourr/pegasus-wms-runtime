@@ -131,7 +131,7 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
     new_jobs = []
 
     for lvl_idx, level_job_ids in enumerate(levels):
-        pred_id = f"pegasus_runtime_pred_L{lvl_idx}"
+        pred_id = f"pegasus_runtime_predictor_L{lvl_idx}"
 
         new_jobs.append({
             "type": "job",
@@ -198,6 +198,24 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
     return str(tmp_path)
 
 
+def _prediction_enabled() -> bool:
+    """
+    Check pegasus.properties for pegasus.runtime.prediction.enable.
+    Defaults to True. Set to 'false' to disable prediction job injection.
+    Also respects PEGASUS_RUNTIME_PREDICTION=false env var.
+    """
+    if os.environ.get("PEGASUS_RUNTIME_PREDICTION", "").lower() in ("false", "0", "no"):
+        return False
+    props_file = Path("pegasus.properties")
+    if props_file.exists():
+        for line in props_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("pegasus.runtime.prediction.enable"):
+                val = line.split("=", 1)[-1].strip().lower()
+                return val not in ("false", "0", "no")
+    return True
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 args    = sys.argv[1:]
@@ -207,17 +225,18 @@ real    = _real_pegasus_plan()
 tmp_wf = None
 plan_args = list(args)
 
-if wf_yaml:
+if wf_yaml and _prediction_enabled():
     tmp_wf = _build_temp_workflow(wf_yaml)
     if tmp_wf:
-        # Replace original workflow path with absolute temp path in args
         wf_abs = str(Path(wf_yaml).resolve())
         plan_args = [tmp_wf if (a == wf_yaml or a == wf_abs) else a for a in args]
-        print(f"[pegasus-plan] Injected prediction jobs into temp workflow for planning.",
+        print("[pegasus-plan] Runtime prediction enabled — injecting predictor jobs.",
               flush=True)
     else:
         print("[pegasus-plan] Could not build temp workflow — planning without prediction jobs.",
               flush=True)
+elif wf_yaml and not _prediction_enabled():
+    print("[pegasus-plan] Runtime prediction disabled — skipping injection.", flush=True)
 
 # Run real pegasus-plan (streams output directly — no capture needed)
 result = subprocess.run([real] + plan_args)

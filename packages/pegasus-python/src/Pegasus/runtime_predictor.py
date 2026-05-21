@@ -383,7 +383,25 @@ class ModelContext:
 
         statuses = []
         for i, row in enumerate(df.itertuples(index=False)):
-            trans   = getattr(row, "transformation", "")
+            trans = getattr(row, "transformation", "")
+
+            # Resolve the canonical name: try exact match first, then
+            # strip namespace (ns::name) and version (name:ver) variants
+            # so training-data names always match workflow YAML names.
+            def _resolve(t):
+                if t in self.known_trans or t in self.rule_map or t in self.smart_rule:
+                    return t
+                # strip namespace prefix  e.g. "pegasus::transfer" → "transfer"
+                base = re.sub(r"^[^:]+::", "", t)
+                if base in self.known_trans or base in self.rule_map or base in self.smart_rule:
+                    return base
+                # strip version suffix  e.g. "transfer:4.0" → "transfer"
+                base2 = re.sub(r":[^:]+$", "", base)
+                if base2 in self.known_trans or base2 in self.rule_map or base2 in self.smart_rule:
+                    return base2
+                return t  # unchanged — will be ZERO_SHOT
+
+            trans   = _resolve(trans)
             n_train = self.trans_counts.get(trans, 0)
             if trans in self.rule_map:
                 rv        = self.rule_map[trans]

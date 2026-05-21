@@ -138,17 +138,82 @@ def _job_subdir(dag_dir: Path) -> Path:
 
 def _read_braindump(dag_dir: Path) -> dict:
     """
-    Parse braindump.txt in the run directory to get workflow UUIDs and other
-    metadata that monitord needs to register jobs in the stampede database.
+    Parse braindump.txt (key: value YAML or key = value) from the run dir.
     """
     bd = dag_dir / "braindump.txt"
     data = {}
-    if bd.exists():
-        for line in bd.read_text().splitlines():
-            if "=" in line:
-                k, _, v = line.partition("=")
-                data[k.strip()] = v.strip()
+    if not bd.exists():
+        return data
+    for line in bd.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # YAML style "key: value" or legacy "key = value"
+        for sep in (":", "="):
+            if sep in line:
+                k, _, v = line.partition(sep)
+                data[k.strip()] = v.strip().strip('"').strip("'")
+                break
     return data
+
+
+def _register_jobs_in_db(dag_dir: Path, bd: dict, job_ids: list, sub_files: dict):
+    """
+    Insert prediction jobs into the per-workflow stampede SQLite database so
+    pegasus-status and monitord can track them like any other planned job.
+    """
+    import sqlite3, glob as _glob
+
+    # Find the per-run workflow DB (not the replicas DB)
+    db_url = bd.get("db_url", bd.get("pegasus_wf_url", ""))
+    db_path = ""
+    if db_url:
+        # strip "sqlite:///" prefix
+        db_path = re.sub(r"^sqlite:///", "", db_url)
+
+    if not db_path or not Path(db_path).exists():
+        # Fallback: find any .db in dag_dir that is not replicas.db
+        candidates = [p for p in dag_dir.glob("*.db")
+                      if "replicas" not in p.name and "workflow" not in p.name.lower()]
+        if candidates:
+            db_path = str(candidates[0])
+
+    if not db_path or not Path(db_path).exists():
+        return  # cannot locate DB — skip silently
+
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+
+        # Get the wf_id for this run
+        wf_uuid = bd.get("wf_uuid", "")
+        row = cur.execute(
+            "SELECT wf_id FROM workflow WHERE wf_uuid = ?", (wf_uuid,)
+        ).fetchone()
+        if not row:
+            con.close()
+            return
+        wf_id = row[0]
+
+        # Insert one row per prediction job (ignore if already exists)
+        for jid in job_ids:
+            cur.execute("""
+                INSERT OR IGNORE INTO job
+                    (wf_id, type_desc, clustered, max_retries,
+                     executable, argv, task_count, submit_file)
+                VALUES (?, 'auxillary', 0, 0, ?, ?, 1, ?)
+            """, (
+                wf_id,
+                sys.executable,
+                f"{_PREDICTOR} --level={jid.split('_L')[-1]}",
+                sub_files.get(jid, ""),
+            ))
+        con.commit()
+        con.close()
+        print(f"[pegasus-plan] Registered {len(job_ids)} prediction job(s) in workflow DB.",
+              flush=True)
+    except Exception as e:
+        print(f"[pegasus-plan] Could not register jobs in DB (non-fatal): {e}", flush=True)
 
 
 def _create_pred_sub(dag_dir: Path, job_id: str, wf_yaml: str,
@@ -247,14 +312,16 @@ def _inject_prediction_jobs(dag_path: str, wf_yaml: str, output_dir: str):
     # All user job IDs for dot patching
     all_job_ids = {jid for level in levels for jid in level}
 
+    bd = _read_braindump(dag_dir)
     job_lines = []
     dep_lines = []
+    sub_files = {}
     prev_level_jobs = None
 
     for lvl_idx, level_jobs in enumerate(levels):
         pred_id  = f"pegasus_runtime_pred_L{lvl_idx}"
-        # Output goes inside the run directory alongside other Pegasus artifacts
         sub_file = _create_pred_sub(dag_dir, pred_id, wf_yaml, output_dir, lvl_idx)
+        sub_files[pred_id] = sub_file
 
         job_lines.append(f"JOB {pred_id} {sub_file}")
 
@@ -278,6 +345,9 @@ def _inject_prediction_jobs(dag_path: str, wf_yaml: str, output_dir: str):
 
     # Patch the Graphviz .dot file so prediction jobs are visible
     _patch_dot_file(dag_dir, levels, all_job_ids)
+
+    # Register jobs in the workflow DB so pegasus-status can track them
+    _register_jobs_in_db(dag_dir, bd, list(sub_files.keys()), sub_files)
 
     print(
         f"[pegasus-plan] Injected {len(levels)} runtime prediction job(s) into DAG.",

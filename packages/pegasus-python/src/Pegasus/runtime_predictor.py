@@ -623,41 +623,80 @@ def patch_sub_file(sub_path: str, prediction: dict) -> bool:
 
 def find_submit_dir(workflow_yml: str) -> str | None:
     """
-    Locate the Pegasus submit ROOT directory for this workflow run.
-    Returns the directory that contains ``braindump.yml`` so that
-    ``scan_sub_files`` can recurse into ``00/00/`` from there.
+    Locate the Pegasus submit ROOT for the **current** workflow run.
+
+    Uses ``$PEGASUS_WF_UUID`` (always present in the job environment) to
+    match the exact braindump.yml for this run — avoids returning an older
+    run's submit directory when multiple runs exist side-by-side.
 
     Tries in order:
     1. ``$PEGASUS_SUBMIT_DIR`` / ``$_PEGASUS_SUBMIT_DIR`` env vars.
-    2. Walk up from CWD looking for ``braindump.yml``.
-    3. Search for ``braindump.yml`` under the workflow YAML directory.
+    2. Walk up from CWD looking for ``braindump.yml`` matching the UUID.
+    3. Search under the workflow YAML directory, UUID-matched first,
+       then any braindump as fallback.
     4. ``submit/`` subtree under the workflow YAML directory.
     """
-    # 1. Pegasus environment variable set at job launch
+    wf_uuid = os.environ.get("PEGASUS_WF_UUID", "")
+
+    def _check_braindump(path: Path) -> str | None:
+        """Return submit dir from braindump if UUID matches (or as fallback)."""
+        try:
+            import yaml as _yaml
+            data = _yaml.safe_load(path.read_text()) or {}
+            sd = data.get("submit_dir") or str(path.parent)
+            if Path(sd).is_dir():
+                return sd
+        except Exception:
+            if path.parent.is_dir():
+                return str(path.parent)
+        return None
+
+    # 1. Explicit Pegasus env var
     for var in ("PEGASUS_SUBMIT_DIR", "_PEGASUS_SUBMIT_DIR"):
         sd = os.environ.get(var)
         if sd and Path(sd).is_dir():
             return sd
 
-    # 2. Walk up from CWD — local-universe jobs often run inside the submit tree
+    # 2. Walk up from CWD — find braindump with matching UUID first
     for candidate in [Path.cwd()] + list(Path.cwd().parents)[:8]:
-        if (candidate / "braindump.yml").is_file():
-            return str(candidate)
-
-    # 3. Search under workflow YAML directory
-    wf_dir = Path(workflow_yml).resolve().parent
-    for search_root in [wf_dir] + list(wf_dir.parents)[:2]:
-        for braindump in search_root.rglob("braindump.yml"):
+        bd = candidate / "braindump.yml"
+        if bd.is_file():
             try:
                 import yaml as _yaml
-                data = _yaml.safe_load(braindump.read_text())
-                sd = data.get("submit_dir") or str(braindump.parent)
-                if Path(sd).is_dir():
-                    return sd
+                data = _yaml.safe_load(bd.read_text()) or {}
+                if not wf_uuid or data.get("wf_uuid") == wf_uuid:
+                    sd = _check_braindump(bd)
+                    if sd:
+                        return sd
             except Exception:
-                return str(braindump.parent)
+                pass
 
-    # 4. submit/ subtree under workflow dir
+    # 3. Search under the workflow YAML directory
+    wf_dir = Path(workflow_yml).resolve().parent
+    all_braindumps = []
+    for search_root in [wf_dir] + list(wf_dir.parents)[:2]:
+        all_braindumps += list(search_root.rglob("braindump.yml"))
+
+    # UUID-matched pass first
+    if wf_uuid:
+        for bd in all_braindumps:
+            try:
+                import yaml as _yaml
+                data = _yaml.safe_load(bd.read_text()) or {}
+                if data.get("wf_uuid") == wf_uuid:
+                    sd = _check_braindump(bd)
+                    if sd:
+                        return sd
+            except Exception:
+                pass
+
+    # Fallback: most recently modified braindump (= current run)
+    for bd in sorted(all_braindumps, key=lambda p: p.stat().st_mtime, reverse=True):
+        sd = _check_braindump(bd)
+        if sd:
+            return sd
+
+    # 4. submit/ subtree
     submit_sub = wf_dir / "submit"
     if submit_sub.is_dir():
         return str(submit_sub)

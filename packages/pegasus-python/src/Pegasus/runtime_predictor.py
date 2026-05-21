@@ -492,7 +492,101 @@ def _build_dag_levels(workflow) -> List[List]:
     return levels
 
 
-def _extract_features(workflow, slot: dict, arts: dict) -> pd.DataFrame:
+def parse_sub_resources(submit_dir: str) -> dict:
+    """
+    Parse all HTCondor .sub files in *submit_dir* and extract per-job
+    resource requests.  Uses the ``+pegasus_wf_dax_job_id`` ClassAd to
+    key results back to workflow YAML job IDs.
+
+    Returns
+    -------
+    dict
+        ``{dax_job_id: {"request_cpus": int, "request_memory_mb": float}}``
+        Only jobs whose .sub file contains ``+pegasus_wf_dax_job_id`` are
+        included; infrastructure jobs (stage-in, cleanup, etc.) are skipped.
+    """
+    resources = {}
+    sub_dir = Path(submit_dir)
+    if not sub_dir.is_dir():
+        return resources
+
+    for sub_path in sub_dir.glob("*.sub"):
+        dax_job_id   = None
+        req_cpus     = None
+        req_memory   = None
+        try:
+            for line in sub_path.read_text().splitlines():
+                line = line.strip()
+                # +pegasus_wf_dax_job_id = "ID000001"
+                m = re.match(
+                    r'\+pegasus_wf_dax_job_id\s*=\s*"?([^"\s]+)"?', line, re.IGNORECASE
+                )
+                if m and m.group(1).lower() != "null":
+                    dax_job_id = m.group(1)
+                # request_cpus = 4
+                m = re.match(r'request_cpus\s*=\s*(\d+)', line, re.IGNORECASE)
+                if m:
+                    req_cpus = int(m.group(1))
+                # request_memory = 8192
+                m = re.match(r'request_memory\s*=\s*([\d.]+)', line, re.IGNORECASE)
+                if m:
+                    req_memory = float(m.group(1))
+        except OSError:
+            continue
+
+        if dax_job_id:
+            resources[dax_job_id] = {
+                "request_cpus":      req_cpus,     # None → keep YAML profile value
+                "request_memory_mb": req_memory,   # None → keep YAML profile value
+            }
+
+    return resources
+
+
+def find_submit_dir(workflow_yml: str) -> str | None:
+    """
+    Locate the HTCondor submit directory that contains the .sub files for
+    this workflow run.  Tries three strategies in order:
+
+    1. Current working directory (local-universe jobs run there).
+    2. ``braindump.yml`` discovered by walking up from *workflow_yml*.
+    3. A ``submit/`` subtree under the workflow directory.
+
+    Returns the directory path (str) or None if not found.
+    """
+    # 1. CWD — when running as universe=local the job runs in the submit dir
+    cwd = Path.cwd()
+    if list(cwd.glob("*.sub")):
+        return str(cwd)
+
+    # 2. braindump.yml search
+    wf_dir = Path(workflow_yml).resolve().parent
+    for search_root in [wf_dir] + list(wf_dir.parents)[:3]:
+        for braindump in search_root.rglob("braindump.yml"):
+            try:
+                import yaml as _yaml
+                data = _yaml.safe_load(braindump.read_text())
+                sd = data.get("submit_dir")
+                if sd:
+                    # look for *.sub files recursively under submit_dir
+                    for sub_file in Path(sd).rglob("*.sub"):
+                        return str(sub_file.parent)
+            except Exception:
+                continue
+
+    # 3. submit/ subtree under workflow dir
+    for candidate in (wf_dir / "submit").rglob("*.sub") if (wf_dir / "submit").is_dir() else []:
+        return str(candidate.parent)
+
+    return None
+
+
+def _extract_features(
+    workflow,
+    slot: dict,
+    arts: dict,
+    sub_resources: Optional[dict] = None,
+) -> pd.DataFrame:
     """
     Build one feature row per job in the workflow using DAG-level traversal.
 
@@ -502,11 +596,15 @@ def _extract_features(workflow, slot: dict, arts: dict) -> pd.DataFrame:
         using the output_ratio per transformation stored in arts, so middle
         jobs get a realistic input_bytes_total instead of 0
 
-    All rows are collected across all levels and returned as a single DataFrame
-    for one batch prediction pass.
+    ``sub_resources`` (optional) overrides cpu_count and ram with actual
+    ``request_cpus`` / ``request_memory`` values parsed from HTCondor .sub files,
+    keyed by DAX job ID.  This closes the gap between training-time features
+    (read from .sub files) and prediction-time features (read from YAML profiles).
 
     SubWorkflow and Pegasus/system auxiliary jobs are skipped at every level.
     """
+    sub_resources = sub_resources or {}
+
     # file lfn → estimated size in bytes (seeded from known File.size values)
     file_size_map: dict = {}
     for jid, job in workflow.jobs.items():
@@ -530,10 +628,20 @@ def _extract_features(workflow, slot: dict, arts: dict) -> pd.DataFrame:
             if ns in ("pegasus", "system"):
                 continue  # aux job
 
-            condor   = _condor_profiles(job)
-            cpu_req  = int(condor.get("request_cpus", slot["cpu_count"]))
-            ram_mb   = float(condor.get("request_memory", 0))
-            ram_kb   = ram_mb * 1_024 if ram_mb > 0 else slot["ram"]
+            # ── Resource resolution: .sub file > YAML profile > slot default ──
+            condor  = _condor_profiles(job)
+            sub_res = sub_resources.get(jid, {})
+
+            req_cpus = (
+                sub_res.get("request_cpus")                        # .sub file (most accurate)
+                or int(condor.get("request_cpus", 0))              # YAML condor profile
+                or slot["cpu_count"]                                # slot default
+            )
+            req_mem_mb = (
+                sub_res.get("request_memory_mb")                   # .sub file (most accurate)
+                or float(condor.get("request_memory", 0))          # YAML condor profile
+            )
+            ram_kb = req_mem_mb * 1_024 if req_mem_mb > 0 else slot["ram"]
 
             inputs            = job.get_inputs() if hasattr(job, "get_inputs") else []
             input_files_count = len(inputs)
@@ -545,7 +653,7 @@ def _extract_features(workflow, slot: dict, arts: dict) -> pd.DataFrame:
                 "job_id":            jid,
                 "transformation":    _full_trans_name(job),
                 "dag_level":         level_idx,
-                "cpu_count":         cpu_req,
+                "cpu_count":         req_cpus,
                 "cpu_speed":         slot["cpu_speed"],
                 "ram":               ram_kb,
                 "input_bytes_total": float(input_bytes_total),
@@ -631,7 +739,7 @@ class WorkflowRuntimePredictor:
         if config.q_hi is not None:
             self._ctx.q_hi = config.q_hi
 
-    def predict(self, workflow) -> List[dict]:
+    def predict(self, workflow, sub_resources: Optional[dict] = None) -> List[dict]:
         """
         Predict runtimes for all jobs in *workflow* and write output files.
 
@@ -640,6 +748,10 @@ class WorkflowRuntimePredictor:
         the current working directory.
 
         :param workflow: a Pegasus Workflow object
+        :param sub_resources: optional dict from :func:`parse_sub_resources` —
+            ``{dax_job_id: {"request_cpus": int, "request_memory_mb": float}}``.
+            When provided, overrides YAML profile values for cpu_count and ram,
+            matching what was used at training time (values from .sub files).
         :return: list of prediction dicts (one per job, same content as CSV rows)
         """
         if not self._cfg.enabled:
@@ -662,7 +774,7 @@ class WorkflowRuntimePredictor:
         if self._cfg.slot_ram       is not None: slot["ram"]       = self._cfg.slot_ram
 
         # ── Step 2: build feature matrix level-by-level, then collect all ───
-        df = _extract_features(workflow, slot, self._ctx.arts)
+        df = _extract_features(workflow, slot, self._ctx.arts, sub_resources=sub_resources)
         if df.empty:
             return []
 

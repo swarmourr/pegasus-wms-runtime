@@ -578,4 +578,4 @@ pegasus-wms-runtime/
 ---
 
 *Generated for Pegasus WMS 5.1.2-dev with PegasusOracle runtime prediction extension.*  
-*Model trained on 42,158 executions · 203 transformations · ISI, WSU, Anvil, Stampede, Expanse, OSG.*
+*Model trained on 203 transformations · ISI, WSU, Anvil, Stampede, Expanse, OSG.*

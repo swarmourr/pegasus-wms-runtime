@@ -608,6 +608,60 @@ def _build_dag_levels(workflow) -> List[List]:
     return levels
 
 
+def read_meta_sizes(submit_dir: str) -> dict:
+    """
+    Scan all Pegasus ``.meta`` files under *submit_dir* and return a
+    mapping of **LFN → size in bytes** (float).
+
+    Pegasus writes one ``.meta`` file per job after it completes, e.g.::
+
+        run00XX/00/00/preprocess_0.meta
+
+    Each file is a JSON array of records::
+
+        [
+          {
+            "_type": "file",
+            "_id": "f.b1",
+            "_attributes": {"size": "1048576", "checksum.type": "sha256", ...}
+          },
+          ...
+        ]
+
+    The ``_id`` field is the LFN; ``_attributes.size`` is the file size in
+    bytes (stored as a string by Pegasus).  This function merges all
+    discovered records into one dict so ``_extract_features`` can seed
+    ``file_size_map`` with actual post-execution sizes rather than the
+    static ``File.size`` values from ``workflow.yml``.
+
+    Returns an empty dict if *submit_dir* does not exist or no ``.meta``
+    files are found.
+    """
+    sizes: dict = {}
+    root = Path(submit_dir)
+    if not root.is_dir():
+        return sizes
+
+    for meta_path in root.rglob("*.meta"):
+        try:
+            records = json.loads(meta_path.read_text())
+            if not isinstance(records, list):
+                continue
+            for rec in records:
+                lfn  = rec.get("_id", "")
+                attrs = rec.get("_attributes", {})
+                raw_size = attrs.get("size", "")
+                if lfn and raw_size:
+                    try:
+                        sizes[lfn] = float(raw_size)
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            continue
+
+    return sizes
+
+
 def scan_sub_files(submit_dir: str) -> dict:
     """
     Single-pass scan of all HTCondor .sub files in *submit_dir*.
@@ -827,6 +881,7 @@ def _extract_features(
     slot: dict,
     arts: dict,
     sub_resources: Optional[dict] = None,
+    submit_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Build one feature row per job in the workflow using DAG-level traversal.
@@ -851,8 +906,16 @@ def _extract_features(
     """
     sub_resources = sub_resources or {}
 
-    # file lfn → estimated size in bytes (seeded from known File.size values)
+    # file lfn → size in bytes.
+    # Priority (highest wins):
+    #   1. Actual size from .meta files written by completed jobs
+    #   2. Static File.size declared in workflow.yml
+    # .meta files are written by Pegasus after each job completes, so for
+    # level N predictors (N ≥ 1) the level N-1 outputs already have .meta
+    # files with exact sizes — far more accurate than workflow.yml estimates.
     file_size_map: dict = {}
+
+    # Seed with static YAML sizes first (lowest priority)
     for jid, job in workflow.jobs.items():
         for f in (job.get_inputs() if hasattr(job, "get_inputs") else []):
             if hasattr(f, "size") and f.size:
@@ -860,6 +923,11 @@ def _extract_features(
         for f in (job.get_outputs() if hasattr(job, "get_outputs") else []):
             if hasattr(f, "size") and f.size:
                 file_size_map[f.lfn] = float(f.size)
+
+    # Override with real sizes from .meta files (highest priority)
+    if submit_dir:
+        meta_sizes = read_meta_sizes(submit_dir)
+        file_size_map.update(meta_sizes)  # overwrites YAML sizes where known
 
     output_ratio = arts.get("output_ratio", {})
 
@@ -1028,7 +1096,9 @@ class WorkflowRuntimePredictor:
         if self._cfg.slot_ram       is not None: slot["ram"]       = self._cfg.slot_ram
 
         # ── Step 2: build feature matrix level-by-level, then collect all ───
-        df = _extract_features(workflow, slot, self._ctx.arts, sub_resources=sub_resources)
+        df = _extract_features(workflow, slot, self._ctx.arts,
+                               sub_resources=sub_resources,
+                               submit_dir=output_dir)
         if df.empty:
             return []
 

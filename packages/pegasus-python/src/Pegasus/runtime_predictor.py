@@ -1183,7 +1183,21 @@ class WorkflowRuntimePredictor:
         import logging as _log
         _logger = _log.getLogger(__name__)
 
-        from Pegasus.api import File, Job, Namespace
+        from Pegasus.api import Job, Namespace
+
+        # Idempotent: remove any existing predictor jobs before re-injecting.
+        # Prevents duplicate output-file errors if this method is called more
+        # than once (e.g. from a user script that calls predict() twice).
+        pred_job_ids = [
+            jid for jid, j in list(workflow.jobs.items())
+            if getattr(j, "transformation", "") == "pegasus-runtime-predictor"
+        ]
+        for jid in pred_job_ids:
+            workflow.jobs.pop(jid, None)
+        if pred_job_ids:
+            _logger.info(
+                f"[runtime-predictor] Removed {len(pred_job_ids)} stale predictor job(s)"
+            )
 
         levels = _build_dag_levels(workflow)
         if not levels:
@@ -1194,15 +1208,17 @@ class WorkflowRuntimePredictor:
         for level_idx, level in enumerate(levels):
             level_job_ids = [jid for jid, _ in level]
 
-            pred_json = File(f"runtime_predictions_L{level_idx}.json")
-            pred_csv  = File(f"runtime_predictions_L{level_idx}.csv")
-
+            # Do NOT declare output files as Pegasus LFNs — the predictor writes
+            # them locally as side-effects and they never need to be staged.
+            # Declaring them caused "duplicate output file" planning errors when
+            # two code paths both tried to inject predictor jobs.
             pred_job = (
                 Job("pegasus-runtime-predictor")
                 .add_args("workflow.yml", output_dir, f"--level={level_idx}")
-                .add_outputs(pred_json, pred_csv, stage_out=True, register_replica=False)
                 .add_profiles(Namespace.PEGASUS, key="job.type", value="auxillary")
                 .add_profiles(Namespace.PEGASUS, key="label",    value=f"runtime-prediction-L{level_idx}")
+                .add_profiles(Namespace.SELECTOR, key="execution.site", value="local")
+                .add_profiles(Namespace.CONDOR,   key="universe",       value="local")
             )
 
             workflow.add_jobs(pred_job)

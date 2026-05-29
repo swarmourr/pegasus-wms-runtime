@@ -371,14 +371,8 @@ if wf_yaml:
                 # wf_yaml was found but comparison failed — substitute directly
                 plan_args = [tmp_wf if a == wf_yaml else a for a in args]
 
-            # Pass standalone TC file so Pegasus definitely sees our entry
-            if tmp_tc:
-                plan_args = [
-                    f"-Dpegasus.catalog.transformation.file={tmp_tc}",
-                ] + plan_args
-
             print(f"[pegasus-plan] Runtime prediction enabled (model: {model}) "
-                  f"— injecting predictor jobs (tc: {tmp_tc}).", flush=True)
+                  f"— injecting predictor jobs.", flush=True)
         else:
             print("[pegasus-plan] Could not build temp workflow — planning without prediction jobs.",
                   flush=True)

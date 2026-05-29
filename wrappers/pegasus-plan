@@ -99,14 +99,85 @@ def _topo_levels(jobs: list, deps: list) -> list:
     return levels
 
 
-def _build_temp_workflow(wf_yaml: str) -> str | None:
+_PRED_SITES = [
+    {
+        "name": "local",
+        "pfn":  _PREDICTOR,
+        "type": "installed",
+    },
+    {
+        "name": "condorpool",
+        "pfn":  _PREDICTOR,
+        "type": "installed",
+        "profiles": {
+            "condor": {"universe": "local"},
+        },
+    },
+]
+
+_PRED_TC_ENTRY = {
+    "name": "pegasus-runtime-predictor",
+    "sites": _PRED_SITES,
+}
+
+
+def _write_standalone_tc(dest_dir: Path) -> str:
+    """
+    Write a standalone _pred_tc.yml that Pegasus can use as a TC source.
+    Merges with any existing tc.yml or properties-configured TC file so
+    user transformations are not lost.
+    Returns absolute path to the file.
+    """
+    transforms = []
+
+    # Collect candidate TC source files (highest priority last → overwrites)
+    tc_candidates: list[Path] = []
+
+    # 1. tc.yml beside the workflow
+    for name in ("tc.yml", "tc.yaml"):
+        p = dest_dir / name
+        if p.exists():
+            tc_candidates.append(p)
+            break
+
+    # 2. TC file specified in pegasus.properties
+    prop_tc = _read_property("pegasus.catalog.transformation.file")
+    if prop_tc:
+        p = Path(prop_tc)
+        if not p.is_absolute():
+            p = dest_dir / prop_tc
+        if p.exists():
+            tc_candidates.append(p)
+
+    for tc_path in tc_candidates:
+        try:
+            existing = yaml.safe_load(tc_path.read_text()) or {}
+            for t in existing.get("transformations", []):
+                if t.get("name") != "pegasus-runtime-predictor":
+                    transforms.append(t)
+        except Exception:
+            pass
+
+    transforms.append(_PRED_TC_ENTRY)
+
+    tc_doc = {
+        "pegasus": "5.0",
+        "transformations": transforms,
+    }
+    out_path = dest_dir / "_pred_tc.yml"
+    with open(out_path, "w") as f:
+        yaml.dump(tc_doc, f, default_flow_style=False, sort_keys=False)
+    return str(out_path)
+
+
+def _build_temp_workflow(wf_yaml: str) -> tuple[str, str] | tuple[None, None]:
     """
     Read workflow.yml, inject prediction jobs and TC entry,
-    write to a temp file beside the original. Returns temp file path.
-    Returns None if injection is not possible (no yaml module, etc).
+    write to a temp file beside the original.
+    Returns (temp_workflow_path, temp_tc_path) or (None, None).
     """
     if yaml is None:
-        return None
+        return None, None
 
     with open(wf_yaml) as f:
         wf = yaml.safe_load(f)
@@ -117,12 +188,11 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
     deps  = wf.get(deps_key, [])
     levels = _topo_levels(jobs, deps)
     if not levels:
-        return None
+        return None, None
 
     output_dir = str(Path(wf_yaml).resolve().parent / "output")
 
     # ── Build dependency map for merging ──────────────────────────────────
-    # dep_map: job_id → set of children (mutable, will be serialised back)
     dep_map = {}
     for dep in deps:
         pid = dep.get("id")
@@ -149,10 +219,10 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
                     "label":    f"runtime-prediction-L{lvl_idx}",
                 },
                 "selector": {
-                    "execution.site": "local",   # force local site like stage-in jobs
+                    "execution.site": "local",
                 },
                 "condor": {
-                    "universe": "local",         # belt-and-suspenders: local universe
+                    "universe": "local",
                 },
             },
         })
@@ -160,7 +230,7 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
         # pred-LN → user jobs at level N
         dep_map.setdefault(pred_id, set()).update(level_job_ids)
 
-        # user jobs at level N-1 → pred-LN  (so pred-LN waits for real data)
+        # user jobs at level N-1 → pred-LN
         if lvl_idx > 0:
             for pjid in levels[lvl_idx - 1]:
                 dep_map.setdefault(pjid, set()).add(pred_id)
@@ -172,40 +242,25 @@ def _build_temp_workflow(wf_yaml: str) -> str | None:
     wf["jobs"] = jobs + new_jobs
     wf[deps_key] = new_deps
 
-    # ── Add TC entry for pegasus-runtime-predictor ────────────────────────
+    # ── Embed TC entry in the workflow YAML ───────────────────────────────
     tc = wf.get("transformationCatalog", {})
     transforms = tc.get("transformations", [])
-    # Only add if not already present
     existing_names = {t.get("name") for t in transforms}
     if "pegasus-runtime-predictor" not in existing_names:
-        transforms.append({
-            "name": "pegasus-runtime-predictor",
-            "sites": [
-                {
-                    "name": "local",
-                    "pfn":  _PREDICTOR,
-                    "type": "installed",
-                },
-                {
-                    "name": "condorpool",
-                    "pfn":  _PREDICTOR,
-                    "type": "installed",
-                    "profiles": {
-                        "condor": {"universe": "local"},
-                    },
-                },
-            ],
-        })
+        transforms.append(_PRED_TC_ENTRY)
     tc["transformations"] = transforms
     wf["transformationCatalog"] = tc
 
-    # Write temp file next to original — absolute path, no leading dot
+    # Write temp workflow file
     orig = Path(wf_yaml).resolve()
     tmp_path = orig.parent / f"_pred_{orig.name}"
     with open(tmp_path, "w") as f:
         yaml.dump(wf, f, default_flow_style=False, sort_keys=False)
 
-    return str(tmp_path)
+    # Write standalone TC as a fallback (more reliable than inline embedding)
+    tmp_tc = _write_standalone_tc(orig.parent)
+
+    return str(tmp_path), tmp_tc
 
 
 def _read_property(key: str) -> str | None:
@@ -267,6 +322,7 @@ wf_yaml = _find_workflow_yaml(args)
 real    = _real_pegasus_plan()
 
 tmp_wf = None
+tmp_tc = None
 plan_args = list(args)
 
 if wf_yaml:
@@ -277,12 +333,34 @@ if wf_yaml:
         print("[pegasus-plan] No model found — runtime prediction disabled. "
               "Train a model or set pegasus.runtime.prediction.model.path.", flush=True)
     else:
-        tmp_wf = _build_temp_workflow(wf_yaml)
+        tmp_wf, tmp_tc = _build_temp_workflow(wf_yaml)
         if tmp_wf:
-            wf_abs = str(Path(wf_yaml).resolve())
-            plan_args = [tmp_wf if (a == wf_yaml or a == wf_abs) else a for a in args]
+            # Robust path replacement: resolve both sides before comparing
+            wf_path = Path(wf_yaml).resolve()
+            replaced = False
+            plan_args = []
+            for a in args:
+                if not replaced and a.endswith((".yml", ".yaml")):
+                    try:
+                        if Path(a).resolve() == wf_path:
+                            plan_args.append(tmp_wf)
+                            replaced = True
+                            continue
+                    except Exception:
+                        pass
+                plan_args.append(a)
+            if not replaced:
+                # wf_yaml was found but comparison failed — substitute directly
+                plan_args = [tmp_wf if a == wf_yaml else a for a in args]
+
+            # Pass standalone TC file so Pegasus definitely sees our entry
+            if tmp_tc:
+                plan_args = [
+                    f"-Dpegasus.catalog.transformation.file={tmp_tc}",
+                ] + plan_args
+
             print(f"[pegasus-plan] Runtime prediction enabled (model: {model}) "
-                  f"— injecting predictor jobs.", flush=True)
+                  f"— injecting predictor jobs (tc: {tmp_tc}).", flush=True)
         else:
             print("[pegasus-plan] Could not build temp workflow — planning without prediction jobs.",
                   flush=True)
@@ -290,8 +368,10 @@ if wf_yaml:
 # Run real pegasus-plan (streams output directly — no capture needed)
 result = subprocess.run([real] + plan_args)
 
-# Clean up temp file
+# Clean up temp files
 if tmp_wf and Path(tmp_wf).exists():
     Path(tmp_wf).unlink()
+if tmp_tc and Path(tmp_tc).exists():
+    Path(tmp_tc).unlink()
 
 sys.exit(result.returncode)

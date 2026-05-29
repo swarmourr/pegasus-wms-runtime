@@ -60,6 +60,9 @@ def _real_pegasus_plan() -> str:
 def _find_workflow_yaml(args) -> str | None:
     for arg in args:
         if (arg.endswith(".yml") or arg.endswith(".yaml")) and Path(arg).exists():
+            # Skip our own temp files so a leftover _pred_*.yml is never reused
+            if Path(arg).name.startswith("_pred_"):
+                continue
             return arg
     return None
 
@@ -182,10 +185,25 @@ def _build_temp_workflow(wf_yaml: str) -> tuple[str, str] | tuple[None, None]:
     with open(wf_yaml) as f:
         wf = yaml.safe_load(f)
 
-    jobs  = wf.get("jobs", [])
+    all_jobs = wf.get("jobs", [])
     # Pegasus 5.x YAML uses "jobDependencies"; older versions use "dependencies"
     deps_key = "jobDependencies" if "jobDependencies" in wf else "dependencies"
-    deps  = wf.get(deps_key, [])
+    all_deps = wf.get(deps_key, [])
+
+    # Strip any predictor jobs/deps left by a previous (failed) planning run
+    pred_ids = {j["id"] for j in all_jobs if j.get("name") == "pegasus-runtime-predictor"}
+    jobs = [j for j in all_jobs if j.get("name") != "pegasus-runtime-predictor"]
+    deps = [
+        {
+            "id": d["id"],
+            "children": [c for c in d.get("children", []) if c not in pred_ids],
+        }
+        for d in all_deps
+        if d.get("id") not in pred_ids
+    ]
+    # Drop now-empty dependency entries
+    deps = [d for d in deps if d["children"]]
+
     levels = _topo_levels(jobs, deps)
     if not levels:
         return None, None

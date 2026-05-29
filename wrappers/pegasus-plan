@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-pegasus-plan wrapper — injects runtime prediction jobs before planning.
+pegasus-plan wrapper — injects runtime prediction as DAGMan PRE scripts.
 
 The user's workflow.yml is NEVER modified. The wrapper:
   1. Reads workflow.yml
   2. Topologically sorts jobs into levels
-  3. Adds one pegasus-runtime-predictor job per level + TC entry
-     into a TEMP copy of the workflow
+  3. Adds dagman.PRE + dagman.PRE_ARGUMENTS profiles to every user job
+     so the predictor runs as a DAGMan SCRIPT PRE before each job
   4. Calls real pegasus-plan with the temp file
   5. Deletes the temp file
 
-The Java planner then handles .sub creation, DB registration,
-pegasus-status tracking, and Graphviz visualization — exactly
-the same as it does for stage-in/cleanup/dirmanager jobs.
+DAGMan SCRIPT PRE runs on the submit host (local) before the job is
+submitted to HTCondor — no TC entry needed, no site selection.
+The predictor is idempotent: if output for a level already exists it
+exits immediately, so parallel jobs at the same level cause no duplication.
 
 DAG shape after planning:
-    [pred-L0] → [L0 user jobs] → [pred-L1] → [L1 user jobs] → ...
+    [pred-L0 PRE] → [L0 user jobs] → [pred-L1 PRE] → [L1 user jobs] → ...
 """
 import os
-import re
 import sys
 import subprocess
 import tempfile
@@ -110,82 +110,17 @@ def _topo_levels(jobs: list, deps: list) -> list:
     return levels
 
 
-_PRED_SITES = [
-    {
-        "name": "local",
-        "pfn":  _PREDICTOR,
-        "type": "installed",
-    },
-    {
-        "name": "condorpool",
-        "pfn":  _PREDICTOR,
-        "type": "installed",
-        "profiles": {
-            "condor": {"universe": "local"},
-        },
-    },
-]
-
-_PRED_TC_ENTRY = {
-    "name": "pegasus-runtime-predictor",
-    "sites": _PRED_SITES,
-}
-
-
-def _write_standalone_tc(dest_dir: Path) -> str:
+def _build_temp_workflow(wf_yaml: str) -> tuple[str, None] | tuple[None, None]:
     """
-    Write a standalone _pred_tc.yml that Pegasus can use as a TC source.
-    Merges with any existing tc.yml or properties-configured TC file so
-    user transformations are not lost.
-    Returns absolute path to the file.
-    """
-    transforms = []
+    Read workflow.yml, attach pegasus-runtime-predictor as a DAGMan SCRIPT PRE
+    on every user job, write to a temp file beside the original.
 
-    # Collect candidate TC source files (highest priority last → overwrites)
-    tc_candidates: list[Path] = []
+    DAGMan runs SCRIPT PRE on the submit host before each job is submitted —
+    no TC entry, no site selection, guaranteed local execution.
+    The predictor is idempotent: level-N output is only written once even if
+    multiple parallel jobs at level N each trigger the prescript.
 
-    # 1. tc.yml beside the workflow
-    for name in ("tc.yml", "tc.yaml"):
-        p = dest_dir / name
-        if p.exists():
-            tc_candidates.append(p)
-            break
-
-    # 2. TC file specified in pegasus.properties
-    prop_tc = _read_property("pegasus.catalog.transformation.file")
-    if prop_tc:
-        p = Path(prop_tc)
-        if not p.is_absolute():
-            p = dest_dir / prop_tc
-        if p.exists():
-            tc_candidates.append(p)
-
-    for tc_path in tc_candidates:
-        try:
-            existing = yaml.safe_load(tc_path.read_text()) or {}
-            for t in existing.get("transformations", []):
-                if t.get("name") != "pegasus-runtime-predictor":
-                    transforms.append(t)
-        except Exception:
-            pass
-
-    transforms.append(_PRED_TC_ENTRY)
-
-    tc_doc = {
-        "pegasus": "5.0",
-        "transformations": transforms,
-    }
-    out_path = dest_dir / "_pred_tc.yml"
-    with open(out_path, "w") as f:
-        yaml.dump(tc_doc, f, default_flow_style=False, sort_keys=False)
-    return str(out_path)
-
-
-def _build_temp_workflow(wf_yaml: str) -> tuple[str, str] | tuple[None, None]:
-    """
-    Read workflow.yml, inject prediction jobs and TC entry,
-    write to a temp file beside the original.
-    Returns (temp_workflow_path, temp_tc_path) or (None, None).
+    Returns (temp_workflow_path, None) or (None, None).
     """
     if yaml is None:
         return None, None
@@ -194,7 +129,6 @@ def _build_temp_workflow(wf_yaml: str) -> tuple[str, str] | tuple[None, None]:
         wf = yaml.safe_load(f)
 
     all_jobs = wf.get("jobs", [])
-    # Pegasus 5.x YAML uses "jobDependencies"; older versions use "dependencies"
     deps_key = "jobDependencies" if "jobDependencies" in wf else "dependencies"
     all_deps = wf.get(deps_key, [])
 
@@ -209,73 +143,41 @@ def _build_temp_workflow(wf_yaml: str) -> tuple[str, str] | tuple[None, None]:
         for d in all_deps
         if d.get("id") not in pred_ids
     ]
-    # Drop now-empty dependency entries
     deps = [d for d in deps if d["children"]]
+
+    # Also strip any previously injected PRE profiles
+    for job in jobs:
+        dagman = job.get("profiles", {}).get("dagman", {})
+        dagman.pop("PRE", None)
+        dagman.pop("PRE_ARGUMENTS", None)
 
     levels = _topo_levels(jobs, deps)
     if not levels:
         return None, None
 
     output_dir = str(Path(wf_yaml).resolve().parent / "output")
+    wf_abs     = str(Path(wf_yaml).resolve())
 
-    # ── Build dependency map for merging ──────────────────────────────────
-    dep_map = {}
-    for dep in deps:
-        pid = dep.get("id")
-        dep_map[pid] = set(dep.get("children", []))
-
-    new_jobs = []
-
+    # Build a jid → level-index map
+    jid_to_level = {}
     for lvl_idx, level_job_ids in enumerate(levels):
-        pred_id = f"pegasus_runtime_predictor_L{lvl_idx}"
+        for jid in level_job_ids:
+            jid_to_level[jid] = lvl_idx
 
-        new_jobs.append({
-            "type": "job",
-            "name": "pegasus-runtime-predictor",
-            "id":   pred_id,
-            "arguments": [
-                str(Path(wf_yaml).resolve()),
-                output_dir,
-                f"--level={lvl_idx}",
-            ],
-            "uses": [],
-            "profiles": {
-                "pegasus": {
-                    "job.type": "auxillary",
-                    "label":    f"runtime-prediction-L{lvl_idx}",
-                },
-                "selector": {
-                    "execution.site": "local",
-                },
-                "condor": {
-                    "universe": "local",
-                },
-            },
+    # Attach PRE script to every user job
+    for job in jobs:
+        jid = job.get("id", "")
+        lvl_idx = jid_to_level.get(jid)
+        if lvl_idx is None:
+            continue
+        profiles = job.setdefault("profiles", {})
+        profiles.setdefault("dagman", {}).update({
+            "PRE":           _PREDICTOR,
+            "PRE_ARGUMENTS": f"{wf_abs} {output_dir} --level={lvl_idx}",
         })
 
-        # pred-LN → user jobs at level N
-        dep_map.setdefault(pred_id, set()).update(level_job_ids)
-
-        # user jobs at level N-1 → pred-LN
-        if lvl_idx > 0:
-            for pjid in levels[lvl_idx - 1]:
-                dep_map.setdefault(pjid, set()).add(pred_id)
-
-    # Serialise dep_map back to list-of-dicts
-    new_deps = [{"id": pid, "children": sorted(cids)}
-                for pid, cids in dep_map.items() if cids]
-
-    wf["jobs"] = jobs + new_jobs
-    wf[deps_key] = new_deps
-
-    # ── Embed TC entry in the workflow YAML ───────────────────────────────
-    tc = wf.get("transformationCatalog", {})
-    transforms = tc.get("transformations", [])
-    existing_names = {t.get("name") for t in transforms}
-    if "pegasus-runtime-predictor" not in existing_names:
-        transforms.append(_PRED_TC_ENTRY)
-    tc["transformations"] = transforms
-    wf["transformationCatalog"] = tc
+    wf["jobs"] = jobs
+    wf[deps_key] = deps
 
     # Write temp workflow file
     orig = Path(wf_yaml).resolve()
@@ -283,10 +185,7 @@ def _build_temp_workflow(wf_yaml: str) -> tuple[str, str] | tuple[None, None]:
     with open(tmp_path, "w") as f:
         yaml.dump(wf, f, default_flow_style=False, sort_keys=False)
 
-    # Write standalone TC as a fallback (more reliable than inline embedding)
-    tmp_tc = _write_standalone_tc(orig.parent)
-
-    return str(tmp_path), tmp_tc
+    return str(tmp_path), None
 
 
 def _read_property(key: str) -> str | None:
@@ -380,7 +279,7 @@ if wf_yaml:
                 plan_args = [tmp_wf if a == wf_yaml else a for a in args]
 
             print(f"[pegasus-plan] Runtime prediction enabled (model: {model}) "
-                  f"— injecting predictor jobs.", flush=True)
+                  f"— injecting predictor as DAGMan PRE scripts.", flush=True)
         else:
             print("[pegasus-plan] Could not build temp workflow — planning without prediction jobs.",
                   flush=True)

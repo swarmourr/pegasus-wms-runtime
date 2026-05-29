@@ -44,7 +44,15 @@ for _pkg in ("pegasus-api", "pegasus-common", "pegasus-python", "pegasus-worker"
     if _p.exists():
         sys.path.insert(0, str(_p))
 
-_PREDICTOR = str(_SRC_DIR / "bin" / "pegasus-runtime-predictor")
+def _find_predictor() -> str:
+    """Priority: pip console script (shutil.which) → source bin/."""
+    import shutil
+    found = shutil.which("pegasus-runtime-predictor")
+    if found:
+        return found
+    return str(_SRC_DIR / "bin" / "pegasus-runtime-predictor")
+
+_PREDICTOR = _find_predictor()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -199,7 +207,11 @@ def _read_property(key: str) -> str | None:
 def _model_path() -> str | None:
     """
     Resolve the model .pkl path.
-    Priority: env var → pegasus.properties → default package location.
+    Priority:
+      1. PEGASUS_RUNTIME_PREDICTION_MODEL env var
+      2. pegasus.runtime.prediction.model.path in pegasus.properties
+      3. importlib.resources (works after pip install)
+      4. Source-tree fallback
     Returns None if no model file is found anywhere.
     """
     # 1. Explicit env var
@@ -212,7 +224,24 @@ def _model_path() -> str | None:
     if prop and Path(prop).is_file():
         return prop
 
-    # 3. Default location: <repo>/packages/pegasus-python/src/Pegasus/models/
+    # 3. importlib.resources — works whether installed via pip or editable
+    try:
+        import importlib.resources as _res
+        try:
+            # Python 3.9+
+            ref = _res.files("Pegasus.models").joinpath("pegasus_oracle_model.pkl")
+            p = Path(str(ref))
+            if p.is_file():
+                return str(p)
+        except AttributeError:
+            # Python 3.6–3.8
+            with _res.path("Pegasus.models", "pegasus_oracle_model.pkl") as p:
+                if p.exists():
+                    return str(p)
+    except Exception:
+        pass
+
+    # 4. Source-tree fallback
     default = (
         _SRC_DIR / "packages" / "pegasus-python"
         / "src" / "Pegasus" / "models" / "pegasus_oracle_model.pkl"

@@ -170,7 +170,7 @@ def _build_temp_workflow(wf_yaml: str) -> tuple[str, None] | tuple[None, None]:
             continue
         profiles = job.setdefault("profiles", {})
         profiles.setdefault("dagman", {})["PRE"] = (
-            f"{_PREDICTOR} {wf_abs} {output_dir} --level={lvl_idx}"
+            f"{_PREDICTOR} {wf_abs} {output_dir} --level={lvl_idx} --job-id={jid}"
         )
 
     wf["jobs"] = jobs

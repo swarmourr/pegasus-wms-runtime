@@ -147,9 +147,7 @@ def _build_temp_workflow(wf_yaml: str) -> tuple[str, None] | tuple[None, None]:
 
     # Also strip any previously injected PRE profiles
     for job in jobs:
-        dagman = job.get("profiles", {}).get("dagman", {})
-        dagman.pop("PRE", None)
-        dagman.pop("PRE_ARGUMENTS", None)
+        job.get("profiles", {}).get("dagman", {}).pop("PRE", None)
 
     levels = _topo_levels(jobs, deps)
     if not levels:
@@ -171,10 +169,9 @@ def _build_temp_workflow(wf_yaml: str) -> tuple[str, None] | tuple[None, None]:
         if lvl_idx is None:
             continue
         profiles = job.setdefault("profiles", {})
-        profiles.setdefault("dagman", {}).update({
-            "PRE":           _PREDICTOR,
-            "PRE_ARGUMENTS": f"{wf_abs} {output_dir} --level={lvl_idx}",
-        })
+        profiles.setdefault("dagman", {})["PRE"] = (
+            f"{_PREDICTOR} {wf_abs} {output_dir} --level={lvl_idx}"
+        )
 
     wf["jobs"] = jobs
     wf[deps_key] = deps

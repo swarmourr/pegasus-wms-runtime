@@ -1183,7 +1183,30 @@ class WorkflowRuntimePredictor:
         import logging as _log
         _logger = _log.getLogger(__name__)
 
-        from Pegasus.api import Job, Namespace
+        import shutil as _shutil
+        from Pegasus.api import Job, Namespace, Transformation, TransformationCatalog, TransformationSite
+
+        # ── Inject TC entry so Pegasus can map the predictor to any site ──────
+        # Resolve binary path: prefer PATH lookup, fall back to location
+        # relative to this module (works for both installed and source layouts).
+        _pred_bin = _shutil.which("pegasus-runtime-predictor") or str(
+            Path(__file__).resolve().parent.parent.parent.parent.parent
+            / "bin" / "pegasus-runtime-predictor"
+        )
+        if workflow.transformation_catalog is None:
+            workflow.transformation_catalog = TransformationCatalog()
+        _existing_tc = {
+            t.name
+            for t in getattr(workflow.transformation_catalog, "transformations", {}).values()
+        }
+        if "pegasus-runtime-predictor" not in _existing_tc:
+            _pred_trans = Transformation("pegasus-runtime-predictor")
+            _pred_trans.add_sites(
+                TransformationSite("local",      _pred_bin, is_stageable=False),
+                TransformationSite("condorpool", _pred_bin, is_stageable=False)
+                    .add_profiles(Namespace.CONDOR, universe="local"),
+            )
+            workflow.transformation_catalog.add_transformations(_pred_trans)
 
         # Idempotent: remove any existing predictor jobs before re-injecting.
         # Prevents duplicate output-file errors if this method is called more

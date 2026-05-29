@@ -1208,6 +1208,41 @@ class WorkflowRuntimePredictor:
             )
             workflow.transformation_catalog.add_transformations(_pred_trans)
 
+        # ── Also patch the external tc.yml in the workflow directory ──────────
+        # Pegasus may read an external tc.yml (from pegasus.properties or CWD)
+        # that overrides the inline TC. Write our entry there too so Pegasus
+        # always finds condorpool regardless of which TC source it prefers.
+        _pred_tc_entry = {
+            "name": "pegasus-runtime-predictor",
+            "sites": [
+                {"name": "local",      "pfn": _pred_bin, "type": "installed"},
+                {"name": "condorpool", "pfn": _pred_bin, "type": "installed",
+                 "profiles": {"condor": {"universe": "local"}}},
+            ],
+        }
+        for _tc_candidate in (
+            Path(output_dir).parent / "tc.yml",
+            Path(output_dir).parent / "tc.yaml",
+            Path("tc.yml"),
+            Path("tc.yaml"),
+        ):
+            if not _tc_candidate.exists():
+                continue
+            try:
+                import yaml as _yaml
+                _tc_data = _yaml.safe_load(_tc_candidate.read_text()) or {}
+                _trans = _tc_data.get("transformations", [])
+                if not any(t.get("name") == "pegasus-runtime-predictor" for t in _trans):
+                    _trans.append(_pred_tc_entry)
+                    _tc_data["transformations"] = _trans
+                    _tc_candidate.write_text(
+                        _yaml.dump(_tc_data, default_flow_style=False, sort_keys=False)
+                    )
+                    _logger.info(f"[runtime-predictor] Patched TC entry into {_tc_candidate}")
+            except Exception as _e:
+                _logger.warning(f"[runtime-predictor] Could not patch {_tc_candidate}: {_e}")
+            break  # only patch the first tc.yml found
+
         # Idempotent: remove any existing predictor jobs before re-injecting.
         # Prevents duplicate output-file errors if this method is called more
         # than once (e.g. from a user script that calls predict() twice).

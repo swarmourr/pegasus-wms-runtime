@@ -30,7 +30,15 @@ except ImportError:
     yaml = None
 
 # ── Package path setup ────────────────────────────────────────────────────────
-_SRC_DIR = Path(__file__).resolve().parent.parent   # pegasus-wms-runtime-src/
+# When run from the repo:    wrappers/ is directly under the repo root
+# When run from install:     wrappers/ is under target_dir; the cloned src
+#                            lives at target_dir/pegasus-wms-runtime-src/
+_WRAPPER_PARENT = Path(__file__).resolve().parent.parent
+_SRC_DIR = (
+    _WRAPPER_PARENT / "pegasus-wms-runtime-src"
+    if (_WRAPPER_PARENT / "pegasus-wms-runtime-src" / "packages").exists()
+    else _WRAPPER_PARENT
+)
 for _pkg in ("pegasus-api", "pegasus-common", "pegasus-python", "pegasus-worker"):
     _p = _SRC_DIR / "packages" / _pkg / "src"
     if _p.exists():

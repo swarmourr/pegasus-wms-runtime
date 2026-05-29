@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 def _install_wrappers(target_dir: Path, src_dir: Path):
     """
-    Write a pegasus-plan Python wrapper into target_dir/wrappers/.
+    Copy the pegasus-plan wrapper from the cloned repo into target_dir/wrappers/.
 
     This directory is placed BEFORE $PEGASUS_HOME/bin in PATH so every
     `pegasus-plan` call is intercepted: the wrapper injects the runtime
@@ -33,90 +33,14 @@ def _install_wrappers(target_dir: Path, src_dir: Path):
     wrappers_dir = target_dir / "wrappers"
     wrappers_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build sys.path inserts for the cloned packages
-    packages = ["pegasus-api", "pegasus-common", "pegasus-python", "pegasus-worker"]
-    path_inserts = "\n".join(
-        f'sys.path.insert(0, str(Path("{src_dir}/packages/{pkg}/src")))'
-        for pkg in packages
-    )
+    repo_wrapper = src_dir / "wrappers" / "pegasus-plan"
+    if not repo_wrapper.exists():
+        raise FileNotFoundError(
+            f"pegasus-plan wrapper not found in cloned repo: {repo_wrapper}"
+        )
 
     wrapper = wrappers_dir / "pegasus-plan"
-    wrapper.write_text(f"""\
-#!/usr/bin/env python3
-\"\"\"
-pegasus-plan wrapper — injects runtime prediction as a native DAG job.
-Intercepts every pegasus-plan call, injects pegasus-runtime-predictor
-(like stage-in/cleanup), then delegates to the real Java planner.
-\"\"\"
-import os, sys, yaml
-from pathlib import Path
-
-{path_inserts}
-
-def _real_pegasus_plan():
-    pegasus_home = os.environ.get("PEGASUS_HOME")
-    if pegasus_home:
-        real = Path(pegasus_home) / "bin" / "pegasus-plan"
-        if real.exists():
-            return str(real)
-    this_bin = str(Path(__file__).parent)
-    for d in os.environ.get("PATH", "").split(":"):
-        if d == this_bin:
-            continue
-        candidate = Path(d) / "pegasus-plan"
-        if candidate.exists():
-            return str(candidate)
-    raise FileNotFoundError("Cannot find real pegasus-plan. Set PEGASUS_HOME.")
-
-def _find_workflow_yaml(args):
-    for arg in args:
-        if (arg.endswith(".yml") or arg.endswith(".yaml")) and Path(arg).exists():
-            return arg
-    return None
-
-def _inject_prediction(workflow_yml):
-    try:
-        from Pegasus.api import File, Job, Namespace, Workflow
-        from Pegasus.runtime_predictor import RuntimePredictionConfig, WorkflowRuntimePredictor
-
-        with open(workflow_yml) as f:
-            raw = yaml.safe_load(f)
-
-        wf = Workflow(raw.get("name", "workflow"), infer_dependencies=False)
-        for jdata in raw.get("jobs", []):
-            job = Job(jdata.get("name", jdata.get("transformation", "unknown")),
-                      _id=jdata.get("id", ""))
-            for u in jdata.get("uses", []):
-                fi = File(u["lfn"])
-                try:
-                    if u.get("size"): fi.size = int(u["size"])
-                except (ValueError, TypeError):
-                    pass
-                if u.get("type") == "input":
-                    job.add_inputs(fi)
-                elif u.get("type") == "output":
-                    job.add_outputs(fi)
-            for k, v in jdata.get("profiles", {{}}).get("condor", {{}}).items():
-                job.add_profiles(Namespace.CONDOR, **{{k: str(v)}})
-            wf.add_jobs(job)
-
-        for dep in raw.get("dependencies", []):
-            for child_id in dep.get("children", []):
-                wf.add_dependency(wf.jobs[dep["id"]], children=[wf.jobs[child_id]])
-
-        output_dir = str(Path(workflow_yml).parent / "output")
-        WorkflowRuntimePredictor(RuntimePredictionConfig(enabled=True, output_dir=output_dir)).predict(wf)
-        wf.write(file=workflow_yml)
-        print("[pegasus-plan] Runtime prediction job injected.", flush=True)
-    except Exception as e:
-        print(f"[pegasus-plan] Runtime prediction skipped: {{e}}", flush=True)
-
-args = sys.argv[1:]
-wf_yaml = _find_workflow_yaml(args)
-if wf_yaml:
-    _inject_prediction(wf_yaml)
-os.execv(_real_pegasus_plan(), [_real_pegasus_plan()] + args)
-""")
+    shutil.copy2(str(repo_wrapper), str(wrapper))
     wrapper.chmod(0o755)
     logging.info(f"Installed pegasus-plan wrapper → {wrapper}")
 

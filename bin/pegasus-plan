@@ -1,33 +1,338 @@
-#!/bin/sh
-#
-# generate a Concrete Dag by providing a DAX
-#
-# $Id$
+#!/usr/bin/env python3
+"""
+pegasus-plan wrapper — injects runtime prediction as DAGMan PRE scripts.
 
-set -e
+The user's workflow.yml is NEVER modified. The wrapper:
+  1. Reads workflow.yml
+  2. Topologically sorts jobs into levels
+  3. Adds dagman.PRE profiles to every user job so the predictor runs
+     as a DAGMan SCRIPT PRE before each job
+  4. Calls real pegasus-plan with the temp file
+  5. Deletes the temp file
 
-# remember the clean CLASSPATH
-if [ "x$PEGASUS_ORIG_CLASSPATH" = "x" ]; then
-    PEGASUS_ORIG_CLASSPATH=$CLASSPATH
-    export PEGASUS_ORIG_CLASSPATH
-fi
+DAGMan SCRIPT PRE runs on the submit host (local) before the job is
+submitted to HTCondor — no TC entry needed, no site selection.
+The predictor is idempotent: if output for a level already exists it
+exits immediately, so parallel jobs at the same level cause no duplication.
 
-PEGASUS_CONFIG="`dirname "$0"`/pegasus-config"
-eval `"$PEGASUS_CONFIG" --sh-dump`
-. "$PEGASUS_SHARE_DIR/sh/java.sh"
+DAG shape after planning:
+    [pred-L0 PRE] → [L0 user jobs] → [pred-L1 PRE] → [L1 user jobs] → ...
+"""
+import os
+import sys
+import subprocess
+import tempfile
+from pathlib import Path
 
-# PEGASUS_HOME should not be set - this is so we can find all the
-# places in the planner which still depends on PEGASUS_HOME
-unset PEGASUS_HOME
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
-# ensure we have a good environment to run in
-$PEGASUS_BIN_DIR/pegasus-preflight-check
+# ── Package path setup ────────────────────────────────────────────────────────
+# bin/pegasus-plan → parent = bin/ → parent.parent = repo root (or dist root)
+# When installed via ant dist, packages are already on sys.path — these inserts
+# are no-ops because the paths won't exist in the dist layout.
+_WRAPPER_PARENT = Path(__file__).resolve().parent.parent
+_SRC_DIR = (
+    _WRAPPER_PARENT / "pegasus-wms-runtime-src"
+    if (_WRAPPER_PARENT / "pegasus-wms-runtime-src" / "packages").exists()
+    else _WRAPPER_PARENT
+)
+for _pkg in ("pegasus-api", "pegasus-common", "pegasus-python", "pegasus-worker"):
+    _p = _SRC_DIR / "packages" / _pkg / "src"
+    if _p.exists():
+        sys.path.insert(0, str(_p))
 
-# run java program
-nice "${JAVA}" \
-       "-Dpegasus.home.sysconfdir=$PEGASUS_CONF_DIR" \
-       "-Dpegasus.home.bindir=$PEGASUS_BIN_DIR" \
-       "-Dpegasus.home.sharedstatedir=$PEGASUS_SHARE_DIR" \
-       "-Dpegasus.home.schemadir=$PEGASUS_SCHEMA_DIR" \
-       $addon edu.isi.pegasus.planner.client.CPlanner $args
+def _find_predictor() -> str:
+    """Priority: pip console script (shutil.which) → same bin dir → source bin/."""
+    import shutil
+    found = shutil.which("pegasus-runtime-predictor")
+    if found:
+        return found
+    # Same bin dir as this wrapper (ant dist layout)
+    same_dir = Path(__file__).resolve().parent / "pegasus-runtime-predictor"
+    if same_dir.exists():
+        return str(same_dir)
+    return str(_SRC_DIR / "bin" / "pegasus-runtime-predictor")
 
+_PREDICTOR = _find_predictor()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _real_pegasus_plan() -> str:
+    """
+    Find the real Java pegasus-plan shell script (pegasus-plan-real).
+
+    Search order:
+      1. pegasus-plan-real in the same bin dir (ant dist layout)
+      2. PEGASUS_HOME/bin/pegasus-plan-real
+      3. PEGASUS_HOME/bin/pegasus-plan (external/system install)
+      4. PATH search for pegasus-plan-real, then pegasus-plan (skip own dir)
+    """
+    this_dir = Path(__file__).resolve().parent
+
+    # 1. Same directory — ant dist layout
+    real = this_dir / "pegasus-plan-real"
+    if real.exists():
+        return str(real)
+
+    # 2 & 3. PEGASUS_HOME
+    pegasus_home = os.environ.get("PEGASUS_HOME")
+    if pegasus_home:
+        for name in ("pegasus-plan-real", "pegasus-plan"):
+            real = Path(pegasus_home) / "bin" / name
+            if real.exists():
+                return str(real)
+
+    # 4. PATH search
+    this_bin = str(this_dir)
+    for d in os.environ.get("PATH", "").split(":"):
+        for name in ("pegasus-plan-real", "pegasus-plan"):
+            if name == "pegasus-plan" and d == this_bin:
+                continue
+            candidate = Path(d) / name
+            if candidate.exists():
+                return str(candidate)
+
+    raise FileNotFoundError(
+        "Cannot find real pegasus-plan. Set PEGASUS_HOME or ensure "
+        "pegasus-plan-real is on PATH."
+    )
+
+
+def _find_workflow_yaml(args) -> str | None:
+    for arg in args:
+        if (arg.endswith(".yml") or arg.endswith(".yaml")) and Path(arg).exists():
+            # Skip our own temp files so a leftover _pred_*.yml is never reused
+            if Path(arg).name.startswith("_pred_"):
+                continue
+            return arg
+    return None
+
+
+def _topo_levels(jobs: list, deps: list) -> list:
+    """
+    Topological sort of workflow jobs into levels.
+    Returns list of levels; each level is a list of job IDs.
+    Skips Pegasus auxiliary jobs (pegasus-runtime-predictor).
+    """
+    job_ids = {j["id"] for j in jobs
+               if j.get("name", "") != "pegasus-runtime-predictor"}
+
+    children_map = {}
+    for dep in (deps or []):
+        pid = dep.get("id")
+        for cid in dep.get("children", []):
+            children_map.setdefault(pid, []).append(cid)
+
+    parent_map = {jid: set() for jid in job_ids}
+    for pid, cids in children_map.items():
+        for cid in cids:
+            if cid in job_ids and pid in job_ids:
+                parent_map[cid].add(pid)
+
+    levels, assigned, remaining = [], set(), set(job_ids)
+    while remaining:
+        level = [j for j in remaining if parent_map.get(j, set()).issubset(assigned)]
+        if not level:
+            level = list(remaining)
+        levels.append(level)
+        assigned.update(level)
+        remaining -= set(level)
+    return levels
+
+
+def _build_temp_workflow(wf_yaml: str) -> tuple[str, None] | tuple[None, None]:
+    """
+    Read workflow.yml, attach pegasus-runtime-predictor as a DAGMan SCRIPT PRE
+    on every user job, write to a temp file beside the original.
+
+    DAGMan runs SCRIPT PRE on the submit host before each job is submitted —
+    no TC entry, no site selection, guaranteed local execution.
+    The predictor is idempotent: level-N output is only written once even if
+    multiple parallel jobs at level N each trigger the prescript.
+
+    Returns (temp_workflow_path, None) or (None, None).
+    """
+    if yaml is None:
+        return None, None
+
+    with open(wf_yaml) as f:
+        wf = yaml.safe_load(f)
+
+    all_jobs = wf.get("jobs", [])
+    deps_key = "jobDependencies" if "jobDependencies" in wf else "dependencies"
+    all_deps = wf.get(deps_key, [])
+
+    # Strip any predictor jobs/deps left by a previous (failed) planning run
+    pred_ids = {j["id"] for j in all_jobs if j.get("name") == "pegasus-runtime-predictor"}
+    jobs = [j for j in all_jobs if j.get("name") != "pegasus-runtime-predictor"]
+    deps = [
+        {
+            "id": d["id"],
+            "children": [c for c in d.get("children", []) if c not in pred_ids],
+        }
+        for d in all_deps
+        if d.get("id") not in pred_ids
+    ]
+    deps = [d for d in deps if d["children"]]
+
+    # Also strip any previously injected PRE profiles
+    for job in jobs:
+        job.get("profiles", {}).get("dagman", {}).pop("PRE", None)
+
+    levels = _topo_levels(jobs, deps)
+    if not levels:
+        return None, None
+
+    output_dir = str(Path(wf_yaml).resolve().parent / "output")
+    wf_abs     = str(Path(wf_yaml).resolve())
+
+    jid_to_level = {}
+    for lvl_idx, level_job_ids in enumerate(levels):
+        for jid in level_job_ids:
+            jid_to_level[jid] = lvl_idx
+
+    # Attach PRE script to every user job
+    for job in jobs:
+        jid = job.get("id", "")
+        lvl_idx = jid_to_level.get(jid)
+        if lvl_idx is None:
+            continue
+        profiles = job.setdefault("profiles", {})
+        profiles.setdefault("dagman", {})["PRE"] = (
+            f"{_PREDICTOR} {wf_abs} {output_dir} --level={lvl_idx} --job-id={jid}"
+        )
+
+    wf["jobs"] = jobs
+    wf[deps_key] = deps
+
+    orig = Path(wf_yaml).resolve()
+    tmp_path = orig.parent / f"_pred_{orig.name}"
+    with open(tmp_path, "w") as f:
+        yaml.dump(wf, f, default_flow_style=False, sort_keys=False)
+
+    return str(tmp_path), None
+
+
+def _read_property(key: str) -> str | None:
+    """Read a single key from pegasus.properties in the current directory."""
+    props_file = Path("pegasus.properties")
+    if props_file.exists():
+        for line in props_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith(key):
+                return line.split("=", 1)[-1].strip()
+    return None
+
+
+def _model_path() -> str | None:
+    """
+    Resolve the model .pkl path.
+    Priority:
+      1. PEGASUS_RUNTIME_PREDICTION_MODEL env var
+      2. pegasus.runtime.prediction.model.path in pegasus.properties
+      3. importlib.resources (works after pip install)
+      4. Source-tree fallback
+    Returns None if no model file is found anywhere.
+    """
+    env = os.environ.get("PEGASUS_RUNTIME_PREDICTION_MODEL")
+    if env and Path(env).is_file():
+        return env
+
+    prop = _read_property("pegasus.runtime.prediction.model.path")
+    if prop and Path(prop).is_file():
+        return prop
+
+    try:
+        import importlib.resources as _res
+        try:
+            ref = _res.files("Pegasus.models").joinpath("pegasus_oracle_model.pkl")
+            p = Path(str(ref))
+            if p.is_file():
+                return str(p)
+        except AttributeError:
+            with _res.path("Pegasus.models", "pegasus_oracle_model.pkl") as p:
+                if p.exists():
+                    return str(p)
+    except Exception:
+        pass
+
+    default = (
+        _SRC_DIR / "packages" / "pegasus-python"
+        / "src" / "Pegasus" / "models" / "pegasus_oracle_model.pkl"
+    )
+    if default.is_file():
+        return str(default)
+
+    return None
+
+
+def _prediction_enabled() -> bool:
+    """
+    Check pegasus.properties for pegasus.runtime.prediction.enable.
+    Defaults to True. Set to 'false' to disable prediction job injection.
+    Also respects PEGASUS_RUNTIME_PREDICTION=false env var.
+    """
+    if os.environ.get("PEGASUS_RUNTIME_PREDICTION", "").lower() in ("false", "0", "no"):
+        return False
+    val = _read_property("pegasus.runtime.prediction.enable")
+    if val is not None:
+        return val.lower() not in ("false", "0", "no")
+    return True
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+args    = sys.argv[1:]
+wf_yaml = _find_workflow_yaml(args)
+real    = _real_pegasus_plan()
+
+tmp_wf = None
+tmp_tc = None
+plan_args = list(args)
+
+if wf_yaml:
+    model = _model_path()
+    if not _prediction_enabled():
+        print("[pegasus-plan] Runtime prediction disabled — skipping injection.", flush=True)
+    elif model is None:
+        print("[pegasus-plan] No model found — runtime prediction disabled. "
+              "Train a model or set pegasus.runtime.prediction.model.path.", flush=True)
+    else:
+        tmp_wf, tmp_tc = _build_temp_workflow(wf_yaml)
+        if tmp_wf:
+            wf_path = Path(wf_yaml).resolve()
+            replaced = False
+            plan_args = []
+            for a in args:
+                if not replaced and a.endswith((".yml", ".yaml")):
+                    try:
+                        if Path(a).resolve() == wf_path:
+                            plan_args.append(tmp_wf)
+                            replaced = True
+                            continue
+                    except Exception:
+                        pass
+                plan_args.append(a)
+            if not replaced:
+                plan_args = [tmp_wf if a == wf_yaml else a for a in args]
+
+            print(f"[pegasus-plan] Runtime prediction enabled (model: {model}) "
+                  f"— injecting predictor as DAGMan PRE scripts.", flush=True)
+        else:
+            print("[pegasus-plan] Could not build temp workflow — planning without prediction jobs.",
+                  flush=True)
+
+# Run real pegasus-plan (streams output directly — no capture needed)
+result = subprocess.run([real] + plan_args)
+
+# Clean up temp files
+if tmp_wf and Path(tmp_wf).exists():
+    Path(tmp_wf).unlink()
+if tmp_tc and Path(tmp_tc).exists():
+    Path(tmp_tc).unlink()
+
+sys.exit(result.returncode)

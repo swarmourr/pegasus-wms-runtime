@@ -21,28 +21,24 @@ htcondor_version = "25.x"
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-def _install_wrappers(target_dir: Path, src_dir: Path):
+def _install_runtime_scripts(target_dir: Path, src_dir: Path):
     """
-    Copy the pegasus-plan wrapper from the cloned repo into target_dir/wrappers/.
+    Copy runtime prediction scripts from the cloned repo into pegasus/bin/.
 
-    This directory is placed BEFORE $PEGASUS_HOME/bin in PATH so every
-    `pegasus-plan` call is intercepted: the wrapper injects the runtime
-    prediction job (like stage-in/stage-out/cleanup) then delegates to
-    the real Java planner via $PEGASUS_HOME/bin/pegasus-plan.
+    - pegasus-plan          : updated shell script that auto-calls inject after planning
+    - pegasus-inject-prescripts : post-processor that adds SCRIPT PRE to .dag
+    - pegasus-runtime-predictor : ML predictor called by each SCRIPT PRE
     """
-    wrappers_dir = target_dir / "wrappers"
-    wrappers_dir.mkdir(parents=True, exist_ok=True)
-
-    repo_wrapper = src_dir / "wrappers" / "pegasus-plan"
-    if not repo_wrapper.exists():
-        raise FileNotFoundError(
-            f"pegasus-plan wrapper not found in cloned repo: {repo_wrapper}"
-        )
-
-    wrapper = wrappers_dir / "pegasus-plan"
-    shutil.copy2(str(repo_wrapper), str(wrapper))
-    wrapper.chmod(0o755)
-    logging.info(f"Installed pegasus-plan wrapper → {wrapper}")
+    pegasus_bin = target_dir / "pegasus" / "bin"
+    for script in ["pegasus-plan", "pegasus-inject-prescripts", "pegasus-runtime-predictor"]:
+        src = src_dir / "bin" / script
+        dst = pegasus_bin / script
+        if src.exists():
+            shutil.copy2(src, dst)
+            dst.chmod(0o755)
+            logging.info(f"Installed {script} → {dst}")
+        else:
+            logging.warning(f"{script} not found at {src} — skipping")
 
 
 def install_pegasus(target_dir: Path, arch: str, os_name: str, os_version: str):
@@ -76,7 +72,7 @@ def install_pegasus(target_dir: Path, arch: str, os_name: str, os_version: str):
     src_dir = target_dir / "pegasus-wms-runtime-src"
     logging.info(f"Cloning Python packages from {PEGASUS_REPO}")
     subprocess.run(
-        ["git", "clone", "--depth=1", PEGASUS_REPO, str(src_dir)],
+        ["git", "clone", "--depth=1", "--branch", "integration", PEGASUS_REPO, str(src_dir)],
         check=True,
     )
 
@@ -86,7 +82,8 @@ def install_pegasus(target_dir: Path, arch: str, os_name: str, os_version: str):
         if pkg_path.exists():
             logging.info(f"Installing Python package: {pkg}")
             subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-e", str(pkg_path), "--quiet"],
+                [sys.executable, "-m", "pip", "install", "-e", str(pkg_path), "--quiet",
+                 "--break-system-packages"],
                 check=True,
             )
 
@@ -94,15 +91,13 @@ def install_pegasus(target_dir: Path, arch: str, os_name: str, os_version: str):
     logging.info("Installing runtime-prediction dependencies")
     subprocess.run(
         [sys.executable, "-m", "pip", "install",
-         "torch", "scikit-learn", "numpy", "pandas", "--quiet"],
+         "torch", "scikit-learn", "numpy", "pandas", "--quiet",
+         "--break-system-packages"],
         check=True,
     )
 
-    # ── Step 4: install pegasus-plan wrapper ──────────────────────────────────
-    # wrappers/ sits BEFORE $PEGASUS_HOME/bin in PATH so our Python wrapper
-    # intercepts `pegasus-plan` and injects the runtime prediction job natively
-    # (like stage-in/stage-out/cleanup) before delegating to the real Java planner.
-    _install_wrappers(target_dir, src_dir)
+    # ── Step 4: install runtime prediction scripts into pegasus/bin/ ─────────
+    _install_runtime_scripts(target_dir, src_dir)
 
 
 
@@ -151,14 +146,11 @@ def install_htcondor(target_dir: Path, arch: str, os_name: str, os_version: str)
 
 def _env_exports(target_dir: Path) -> str:
     """Return shell export statements for the Pegasus + Condor environment."""
-    pegasus_bin  = target_dir / "pegasus" / "bin"
-    wrappers_bin = target_dir / "wrappers"
+    pegasus_bin = target_dir / "pegasus" / "bin"
     return (
         f"export PEGASUS_HOME={target_dir}/pegasus\n"
         f"export CONDOR_CONFIG={target_dir}/condor/condor.conf\n"
-        # wrappers_bin MUST come before pegasus_bin so our pegasus-plan
-        # wrapper intercepts every call before the real Java planner
-        f"export PATH={wrappers_bin}:{pegasus_bin}:{target_dir}/condor/bin:{target_dir}/condor/sbin:$PATH\n"
+        f"export PATH={pegasus_bin}:{target_dir}/condor/bin:{target_dir}/condor/sbin:$PATH\n"
     )
 
 

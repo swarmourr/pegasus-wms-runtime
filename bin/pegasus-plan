@@ -46,7 +46,8 @@ for _a in $_PLAN_ARGS; do
 done
 
 if [ -n "$_dir" ] && command -v pegasus-inject-prescripts >/dev/null 2>&1; then
-    _run_dir=$(ls -dt "$_dir"/run* 2>/dev/null | head -1)
+    # Pegasus nests the run dir: <dir>/<user>/pegasus/<wf>/runNNNN/
+    _run_dir=$(find "$_dir" -maxdepth 6 -type d -name "run[0-9]*" 2>/dev/null | sort | tail -1)
     if [ -n "$_run_dir" ]; then
         echo "[pegasus-plan] Injecting runtime prediction prescripts into $_run_dir"
         pegasus-inject-prescripts "$_run_dir" || true

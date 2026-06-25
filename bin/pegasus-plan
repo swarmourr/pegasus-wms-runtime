@@ -26,30 +26,44 @@ unset PEGASUS_HOME
 # ensure we have a good environment to run in
 $PEGASUS_BIN_DIR/pegasus-preflight-check
 
-# run java program
+# Run Java planner — capture output to parse the submit dir, show it to the user.
+# We capture to a temp file so we can extract the run dir from the planner's
+# "pegasus-run  /path/to/runNNNN" line without requiring --dir.
+_tmpout=$(mktemp)
+set +e
 nice "${JAVA}" \
        "-Dpegasus.home.sysconfdir=$PEGASUS_CONF_DIR" \
        "-Dpegasus.home.bindir=$PEGASUS_BIN_DIR" \
        "-Dpegasus.home.sharedstatedir=$PEGASUS_SHARE_DIR" \
        "-Dpegasus.home.schemadir=$PEGASUS_SCHEMA_DIR" \
-       $addon edu.isi.pegasus.planner.client.CPlanner $args
+       $addon edu.isi.pegasus.planner.client.CPlanner $args > "$_tmpout" 2>&1
+_rc=$?
+set -e
+cat "$_tmpout"
+[ "$_rc" -eq 0 ] || { rm -f "$_tmpout"; exit "$_rc"; }
 
 # After planning succeeds, inject runtime prediction prescripts.
-# Parse --dir / -d from the saved args to find the submit directory.
-_dir=""
-_prev=""
-for _a in $_PLAN_ARGS; do
-    if [ "$_prev" = "--dir" ] || [ "$_prev" = "-d" ]; then
-        _dir="$_a"
-    fi
-    _prev="$_a"
-done
+# 1. Parse run dir directly from planner output (works without --dir)
+# 2. Fallback: search under --dir / -d if provided
+_run_dir=$(grep "pegasus-run" "$_tmpout" 2>/dev/null | awk '{print $NF}' | grep "run[0-9]" | head -1)
 
-if [ -n "$_dir" ] && command -v pegasus-inject-prescripts >/dev/null 2>&1; then
-    # Pegasus nests the run dir: <dir>/<user>/pegasus/<wf>/runNNNN/
-    _run_dir=$(find "$_dir" -maxdepth 6 -type d -name "run[0-9]*" 2>/dev/null | sort | tail -1)
-    if [ -n "$_run_dir" ]; then
-        echo "[pegasus-plan] Injecting runtime prediction prescripts into $_run_dir"
-        pegasus-inject-prescripts "$_run_dir" || true
+if [ -z "$_run_dir" ]; then
+    _dir=""
+    _prev=""
+    for _a in $_PLAN_ARGS; do
+        if [ "$_prev" = "--dir" ] || [ "$_prev" = "-d" ]; then
+            _dir="$_a"
+        fi
+        _prev="$_a"
+    done
+    if [ -n "$_dir" ]; then
+        _run_dir=$(find "$_dir" -maxdepth 6 -type d -name "run[0-9]*" 2>/dev/null | sort | tail -1)
     fi
+fi
+
+rm -f "$_tmpout"
+
+if [ -n "$_run_dir" ] && command -v pegasus-inject-prescripts >/dev/null 2>&1; then
+    echo "[pegasus-plan] Injecting runtime prediction prescripts into $_run_dir"
+    pegasus-inject-prescripts "$_run_dir" || true
 fi

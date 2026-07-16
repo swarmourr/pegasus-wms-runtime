@@ -31,11 +31,6 @@ install_requires = [
     "pegasus-wms.api",
     "pegasus-wms.common",
     "pegasus-wms.worker",
-    # Runtime prediction
-    "torch>=1.13",
-    "scikit-learn>=1.0",
-    "numpy>=1.21",
-    "pandas>=1.3",
 ]
 
 
@@ -129,7 +124,6 @@ setup(
     packages=find_namespace_packages(where="src"),
     package_data={
         "Pegasus.service": find_package_data("src/Pegasus/service/"),
-        "Pegasus.models":  [".gitkeep", ".gitignore", "*.pkl"],
     },
     include_package_data=True,
     zip_safe=False,
@@ -137,6 +131,7 @@ setup(
     entry_points={
         "console_scripts": [
             "pegasus-runtime-predictor = Pegasus.cli.pegasus_runtime_predictor:_run",
+            "pegasus-inject-prescripts  = Pegasus.cli.pegasus_inject_prescripts:main",
         ],
     },
     convert_2to3_doctests=[],
@@ -144,5 +139,6 @@ setup(
         "postgresql": ["psycopg2"],
         "mysql": ["pymysql"],
         "cwl": ["cwl-utils==0.11", "jsonschema==3.2.0"],
+        "runtime": ["pegasus-wms.runtime"],
     },
 )

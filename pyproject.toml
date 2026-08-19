@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "pegasus-wms-runtime-full"
+version = "5.2.0.dev0"
+description = "Pegasus WMS with Runtime Prediction — single install meta-package"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.6"
+dependencies = [
+    "pegasus-wms.api @ git+https://github.com/swarmourr/pegasus-wms-runtime.git@integration#subdirectory=packages/pegasus-api",
+    "pegasus-wms.common @ git+https://github.com/swarmourr/pegasus-wms-runtime.git@integration#subdirectory=packages/pegasus-common",
+    "pegasus-wms.worker @ git+https://github.com/swarmourr/pegasus-wms-runtime.git@integration#subdirectory=packages/pegasus-worker",
+    "pegasus-wms @ git+https://github.com/swarmourr/pegasus-wms-runtime.git@integration#subdirectory=packages/pegasus-python",
+    "pegasus-wms.runtime @ git+https://github.com/swarmourr/pegasus-wms-runtime.git@integration#subdirectory=packages/pegasus-runtime",
+]
+
+[tool.setuptools]
+script-files = ["bin/pegasus-plan"]

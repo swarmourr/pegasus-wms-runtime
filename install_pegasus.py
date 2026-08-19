@@ -23,22 +23,21 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 def _install_runtime_scripts(target_dir: Path, src_dir: Path):
     """
-    Copy runtime prediction scripts from the cloned repo into pegasus/bin/.
+    Copy pegasus-plan shell script from the cloned repo into pegasus/bin/.
 
-    - pegasus-plan          : updated shell script that auto-calls inject after planning
-    - pegasus-inject-prescripts : post-processor that adds SCRIPT PRE to .dag
-    - pegasus-runtime-predictor : ML predictor called by each SCRIPT PRE
+    pegasus-inject-prescripts and pegasus-runtime-predictor are Python entry
+    points registered by pegasus-python and pegasus-runtime packages — they
+    are installed automatically by pip and do not need to be copied here.
     """
     pegasus_bin = target_dir / "pegasus" / "bin"
-    for script in ["pegasus-plan", "pegasus-inject-prescripts", "pegasus-runtime-predictor"]:
-        src = src_dir / "bin" / script
-        dst = pegasus_bin / script
-        if src.exists():
-            shutil.copy2(src, dst)
-            dst.chmod(0o755)
-            logging.info(f"Installed {script} → {dst}")
-        else:
-            logging.warning(f"{script} not found at {src} — skipping")
+    src = src_dir / "bin" / "pegasus-plan"
+    dst = pegasus_bin / "pegasus-plan"
+    if src.exists():
+        shutil.copy2(src, dst)
+        dst.chmod(0o755)
+        logging.info(f"Installed pegasus-plan → {dst}")
+    else:
+        logging.warning(f"pegasus-plan not found at {src} — skipping")
 
 
 def install_pegasus(target_dir: Path, arch: str, os_name: str, os_version: str):
@@ -77,7 +76,7 @@ def install_pegasus(target_dir: Path, arch: str, os_name: str, os_version: str):
     )
 
     packages_dir = src_dir / "packages"
-    for pkg in ["pegasus-common", "pegasus-worker", "pegasus-api", "pegasus-python"]:
+    for pkg in ["pegasus-common", "pegasus-worker", "pegasus-api", "pegasus-python", "pegasus-runtime"]:
         pkg_path = packages_dir / pkg
         if pkg_path.exists():
             logging.info(f"Installing Python package: {pkg}")
@@ -86,15 +85,6 @@ def install_pegasus(target_dir: Path, arch: str, os_name: str, os_version: str):
                  "--break-system-packages"],
                 check=True,
             )
-
-    # ── Step 3: install ML dependencies ──────────────────────────────────────
-    logging.info("Installing runtime-prediction dependencies")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install",
-         "torch", "scikit-learn", "numpy", "pandas", "--quiet",
-         "--break-system-packages"],
-        check=True,
-    )
 
     # ── Step 4: install runtime prediction scripts into pegasus/bin/ ─────────
     _install_runtime_scripts(target_dir, src_dir)

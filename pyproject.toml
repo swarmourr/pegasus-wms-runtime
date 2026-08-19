@@ -17,4 +17,4 @@ dependencies = [
 ]
 
 [tool.setuptools]
-script-files = ["bin/pegasus-plan"]
+packages = []

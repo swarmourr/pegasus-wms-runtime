@@ -1,68 +1,40 @@
 #!/bin/sh
 #
-# generate a Concrete Dag by providing a DAX
+# pegasus-plan wrapper — delegates to the real pegasus-plan in PEGASUS_HOME,
+# then injects runtime prediction prescripts into the generated submit dir.
 #
-# $Id$
+# Works in two modes:
+#   1. Zero-install: PEGASUS_HOME points to an extracted tarball
+#   2. System install: falls back to the next pegasus-plan in PATH
 
-set -e
-
-# save original args before java.sh processes them
-_PLAN_ARGS="$*"
-
-# remember the clean CLASSPATH
-if [ "x$PEGASUS_ORIG_CLASSPATH" = "x" ]; then
-    PEGASUS_ORIG_CLASSPATH=$CLASSPATH
-    export PEGASUS_ORIG_CLASSPATH
+# Find the real pegasus-plan — never call ourselves recursively
+if [ -n "$PEGASUS_HOME" ] && [ -x "$PEGASUS_HOME/bin/pegasus-plan" ]; then
+    _REAL="$PEGASUS_HOME/bin/pegasus-plan"
+else
+    # Fall back to next pegasus-plan in PATH (skip ourselves)
+    _SELF="$(cd "$(dirname "$0")" && pwd)/pegasus-plan"
+    _REAL="$(PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "$(dirname "$_SELF")" | tr '\n' ':') which pegasus-plan 2>/dev/null)"
 fi
 
-PEGASUS_CONFIG="`dirname "$0"`/pegasus-config"
-eval `"$PEGASUS_CONFIG" --sh-dump`
-. "$PEGASUS_SHARE_DIR/sh/java.sh"
+if [ -z "$_REAL" ] || [ ! -x "$_REAL" ]; then
+    echo "[pegasus-plan] ERROR: cannot find real pegasus-plan. Set PEGASUS_HOME." >&2
+    exit 1
+fi
 
-# PEGASUS_HOME should not be set - this is so we can find all the
-# places in the planner which still depends on PEGASUS_HOME
-unset PEGASUS_HOME
-
-# ensure we have a good environment to run in
-$PEGASUS_BIN_DIR/pegasus-preflight-check
-
-# Run Java planner — capture output to parse the submit dir, show it to the user.
-# We capture to a temp file so we can extract the run dir from the planner's
-# "pegasus-run  /path/to/runNNNN" line without requiring --dir.
+# Run the real planner, capture output to detect submit dir
 _tmpout=$(mktemp)
 set +e
-nice "${JAVA}" \
-       "-Dpegasus.home.sysconfdir=$PEGASUS_CONF_DIR" \
-       "-Dpegasus.home.bindir=$PEGASUS_BIN_DIR" \
-       "-Dpegasus.home.sharedstatedir=$PEGASUS_SHARE_DIR" \
-       "-Dpegasus.home.schemadir=$PEGASUS_SCHEMA_DIR" \
-       $addon edu.isi.pegasus.planner.client.CPlanner $args > "$_tmpout" 2>&1
+"$_REAL" "$@" > "$_tmpout" 2>&1
 _rc=$?
 set -e
 cat "$_tmpout"
 [ "$_rc" -eq 0 ] || { rm -f "$_tmpout"; exit "$_rc"; }
 
-# After planning succeeds, inject runtime prediction prescripts.
-# 1. Parse run dir directly from planner output (works without --dir)
-# 2. Fallback: search under --dir / -d if provided
+# Auto-detect submit dir from "pegasus-run /path/runNNNN" line in output
 _run_dir=$(grep "pegasus-run" "$_tmpout" 2>/dev/null | awk '{print $NF}' | grep "run[0-9]" | head -1)
-
-if [ -z "$_run_dir" ]; then
-    _dir=""
-    _prev=""
-    for _a in $_PLAN_ARGS; do
-        if [ "$_prev" = "--dir" ] || [ "$_prev" = "-d" ]; then
-            _dir="$_a"
-        fi
-        _prev="$_a"
-    done
-    if [ -n "$_dir" ]; then
-        _run_dir=$(find "$_dir" -maxdepth 6 -type d -name "run[0-9]*" 2>/dev/null | sort | tail -1)
-    fi
-fi
-
 rm -f "$_tmpout"
 
+# Inject runtime prediction prescripts
 if [ -n "$_run_dir" ] && command -v pegasus-inject-prescripts >/dev/null 2>&1; then
     echo "[pegasus-plan] Injecting runtime prediction prescripts into $_run_dir"
     pegasus-inject-prescripts "$_run_dir" || true

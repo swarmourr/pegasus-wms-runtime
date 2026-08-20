@@ -31,7 +31,7 @@ cat "$_tmpout"
 [ "$_rc" -eq 0 ] || { rm -f "$_tmpout"; exit "$_rc"; }
 
 # Auto-detect submit dir from "pegasus-run /path/runNNNN" line in output
-_run_dir=$(grep "pegasus-run" "$_tmpout" 2>/dev/null | awk '{print $NF}' | grep "run[0-9]" | grep -v "jdbc:" | grep -v "\." | head -1)
+_run_dir=$(grep "pegasus-run" "$_tmpout" 2>/dev/null | grep -oE '/[^[:space:]]+/run[0-9]+' | head -1)
 rm -f "$_tmpout"
 
 # Inject runtime prediction prescripts

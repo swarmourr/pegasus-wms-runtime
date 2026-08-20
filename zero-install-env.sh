@@ -12,8 +12,8 @@ _SELF="${BASH_SOURCE[0]:-${(%):-%x}}"
 _SELF="${_SELF:-$0}"
 REPO="$(cd "$(dirname "$_SELF")" && pwd)"
 
-# ── Pegasus binary (first arg, or ~/pegasus-local) ───────────────────────────
-_PEG_ARG="${1:-$HOME/pegasus-local}"
+# ── Pegasus binary (first arg, or ../pegasus relative to this repo) ──────────
+_PEG_ARG="${1:-$REPO/../pegasus}"
 PEGASUS_TAR="$(cd "$_PEG_ARG" 2>/dev/null && pwd)"
 if [ -z "$PEGASUS_TAR" ]; then
     echo "[zero-install-env] ERROR: Pegasus home not found at: $_PEG_ARG" >&2

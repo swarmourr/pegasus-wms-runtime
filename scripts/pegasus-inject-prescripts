@@ -1,2 +1,2 @@
 #!/bin/sh
-exec python3 -m Pegasus.cli.pegasus_inject_prescripts "$@"
+exec ${PEGASUS_PYTHON:-python3} -m Pegasus.cli.pegasus_inject_prescripts "$@"

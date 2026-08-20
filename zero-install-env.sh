@@ -24,6 +24,27 @@ fi
 
 export PEGASUS_HOME="$PEGASUS_TAR"
 
+# ── Python 3.8+ — create a local python3 symlink pointing to python3.12 ──────
+# Safe for shared accounts: only affects sessions that source this file.
+_LOCALBIN="$REPO/localbin"
+mkdir -p "$_LOCALBIN"
+for _py in python3.12 python3.11 python3.10 python3.9 python3.8; do
+    if command -v "$_py" >/dev/null 2>&1; then
+        ln -sf "$(command -v "$_py")" "$_LOCALBIN/python3"
+        export PEGASUS_PYTHON="$_LOCALBIN/python3"
+        break
+    fi
+done
+export PATH="$_LOCALBIN:$PATH"
+
+# ── Python interpreter — prefer python3.12+, fall back to python3 ────────────
+for _py in python3.12 python3.11 python3.10 python3.9 python3.8 python3; do
+    if command -v "$_py" >/dev/null 2>&1; then
+        export PEGASUS_PYTHON="$_py"
+        break
+    fi
+done
+
 # ── Python packages — loaded directly from source, no pip install ────────────
 export PYTHONPATH="\
 $REPO/packages/pegasus-api/src:\

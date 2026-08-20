@@ -29,6 +29,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Optional
 
 try:
     import yaml as _yaml
@@ -92,7 +93,7 @@ def _find_dag_and_braindump(submit_dir: Path):
     return dag_path, braindump
 
 
-def _workflow_yml_from_braindump(braindump: Path) -> str | None:
+def _workflow_yml_from_braindump(braindump: Path) -> Optional[str]:
     """Read workflow.yml path from braindump.yml 'dax' field."""
     if not _HAS_YAML:
         return None
@@ -107,7 +108,7 @@ def _workflow_yml_from_braindump(braindump: Path) -> str | None:
     return None
 
 
-def _dax_job_id_from_sub(sub_path: Path) -> str | None:
+def _dax_job_id_from_sub(sub_path: Path) -> Optional[str]:
     """
     Read +pegasus_wf_dax_job_id from a .sub file.
     Returns the original DAX job ID (e.g. 'preprocess_0') or None for system jobs.

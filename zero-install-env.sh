@@ -45,6 +45,8 @@ $REPO/scripts:\
 $PEGASUS_TAR/bin:\
 ${PATH:-}"
 
+export PATH=/scitech/shared/home/bamboo/pegasus-runtime/Montage/bin:$PATH
+
 echo "[zero-install-env] PEGASUS_HOME = $PEGASUS_HOME"
 echo "[zero-install-env] venv         = $_VENV"
 echo "[zero-install-env] python       = $(python --version 2>&1)"

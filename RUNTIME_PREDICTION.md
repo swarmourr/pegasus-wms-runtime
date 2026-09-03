@@ -157,20 +157,33 @@ Before feature engineering, raw names are resolved to canonical training names v
 
 The model takes **17 features** per job: 9 numeric + 8 name-embedding dimensions.
 
-| # | Feature | Source at prediction time | Description |
-|---|---------|--------------------------|-------------|
-| 0 | `log_anchor_runtime` | pkl `trans_map` / `bucket_map` | log1p of the per-transformation median runtime from training |
-| 1 | `log_cpu_power` | condor_status slot | log1p(machine_cpu_count × cpu_speed_MHz) |
-| 2 | `log_ram` | .sub file `request_memory` | log1p(requested memory in kB) |
-| 3 | `log_input_bytes` | disk scan + YAML File.size | log1p(total input file bytes) |
-| 4 | `log_io_intensity` | derived | log1p(input_bytes / input_files_count) — bytes per file |
-| 5 | `log_compute_intensity` | derived | log1p(input_bytes / cpu_power) — data per compute unit |
-| 6 | `memory_pressure` | derived | request_memory / request_cpus — memory per requested CPU |
-| 7 | `site_encoded` | condor_status hostname | Integer site bucket (see table below) |
-| 8 | `log_input_files_count` | workflow definition | log1p(number of input files) |
-| 9–16 | name embedding dims 0–7 | TF-IDF + SVD on job name | 8-dimensional character n-gram embedding |
+| # | Feature | Formula | Training source | Inference source |
+|---|---------|---------|----------------|-----------------|
+| 0 | `log_anchor_runtime` | `log1p(anchor_runtime)` | 4-level lookup from training medians (see below) | Same lookup from `.pkl` artifacts |
+| 1 | `log_cpu_power` | `log1p(cpu_count × cpu_speed)` | kickstart `<machine>` XML | `condor_status -json` slot query |
+| 2 | `log_ram` | `log1p(ram_kB)` | kickstart `<machine><memory>` | `.sub` file `request_memory` (MB → kB) or slot default |
+| 3 | `log_input_bytes` | `log1p(Σ input file bytes)` | kickstart `<statinfo size=...>` | `.meta` files (post-L0) → `workflow.yml` `File.size` → 0 |
+| 4 | `log_io_intensity` | `log1p(input_bytes / (files+1))` | derived | derived |
+| 5 | `log_compute_intensity` | `log1p(input_bytes / cpu_power)` | derived | derived |
+| 6 | `memory_pressure` | `ram / request_cpus` | kickstart ram / `.sub` request_cpus | `.sub` `request_memory` / `.sub` `request_cpus` |
+| 7 | `site_encoded` | integer 0–5 | kickstart hostname → site bucket | `condor_status` hostname → site bucket |
+| 8 | `log_input_files_count` | `log1p(file count)` | kickstart input file count | `workflow.yml` job input file list |
+| 9–16 | name embedding [0–7] | TF-IDF char n-grams → SVD | transformation name from Stampede DB | transformation name from `workflow.yml` |
 
-> **Note on `cpu_count`:** Training data recorded the actual machine CPU count from kickstart output (whole-node allocations). The predictor therefore uses `slot["cpu_count"]` from `condor_status` for this feature — not `request_cpus`. The `request_cpus` value is used only for `memory_pressure`.
+> **Note on `cpu_count`:** Training data recorded the actual **machine** CPU count from kickstart (whole-node allocations). At inference time the predictor uses `slot["cpu_count"]` from `condor_status` — not `request_cpus`. The `request_cpus` value is used only for `memory_pressure`.
+
+### Anchor Runtime — 4-Level Fallback
+
+The `anchor_runtime` feature seeds the model with historical knowledge before the neural network runs:
+
+```
+Priority 1 → trans_map[exact_transformation_name]   # per-transformation median (best)
+Priority 2 → synth_map[job_id_prefix]               # numeric job-id cluster median
+Priority 3 → bucket_map[(bytes_bin, cpu_count, site)]  # resource-bucket median (75 buckets)
+Priority 4 → global_median = 164 s                  # absolute fallback
+```
+
+All four maps are stored in the `.pkl` file at training time.
 
 ### Site Encoding
 
@@ -182,6 +195,83 @@ The model takes **17 features** per job: 9 numeric + 8 name-embedding dimensions
 | 3 | Stampede / TACC / Frontera (`*stampede*`, `*tacc*`, `*frontera*`) |
 | 4 | Expanse / SDSC (`*expanse*`, `*sdsc*`) |
 | 5 | All other / OSG / unknown (73 % of training data) |
+
+---
+
+## Training Data Schema
+
+The model is trained on a CSV where **each row is one completed job execution**. These values come from Pegasus monitoring (`pegasus-monitord`, kickstart XML output, and the Stampede workflow database).
+
+### Required CSV Columns
+
+| Column | Type | Unit | Source at training time | Description |
+|--------|------|------|------------------------|-------------|
+| `transformation` | string | — | `task.transformation` in Stampede DB | Canonical name: `[ns::]name[:version]`, e.g. `diamond::preprocess:4.0` |
+| `runtime` | float | seconds | `job_instance.local_duration` or `invocation.remote_duration` | **Target variable** — actual wall-clock runtime |
+| `job_id` | string | — | `job.exec_job_id` in Stampede DB | Used to derive the `synth` prefix for cluster grouping |
+| `cpu_count` | int | cores | kickstart `<machine><cpu count=...>` | **Machine** total CPU count (not requested CPUs) |
+| `cpu_speed` | float | MHz | kickstart `<machine><cpu speed=...>` | CPU clock speed from kickstart host info |
+| `ram` | float | kB | kickstart `<machine><memory total=...>` | Total machine RAM in kilobytes |
+| `input_bytes_total` | float | bytes | kickstart `<file><statinfo size=...>` on inputs | Sum of all input file sizes as measured by kickstart |
+| `input_files_count` | int | count | kickstart `<uses linkage="input">` count | Number of input files declared in the job |
+| `hostname` | string | — | kickstart `<machine><uname nodename=...>` | Execution node hostname — used for site encoding |
+
+### Optional Columns (improve accuracy if present)
+
+| Column | Type | Unit | Source | Description |
+|--------|------|------|--------|-------------|
+| `request_cpus` | int | cores | HTCondor `.sub` file `request_cpus` | CPUs the job requested (used for `memory_pressure`) |
+| `request_memory` | float | MB | HTCondor `.sub` file `request_memory` | Memory the job requested |
+
+### Where Training Data Comes From
+
+```
+Pegasus workflow execution
+        │
+        ├── kickstart XML (per-job invocation record)
+        │       ├── cpu_count, cpu_speed, ram    ← <machine> element
+        │       ├── input_bytes_total            ← <file linkage="input"><statinfo size=...>
+        │       └── hostname                     ← <machine><uname nodename=...>
+        │
+        ├── Stampede DB (sqlite / PostgreSQL, written by pegasus-monitord)
+        │       ├── transformation               ← task.transformation
+        │       ├── runtime                      ← job_instance.local_duration
+        │       ├── job_id                       ← job.exec_job_id
+        │       └── input_files_count            ← count of task_edge / file entries
+        │
+        └── HTCondor .sub files (submit-time)
+                └── request_cpus, request_memory ← submit file ClassAds
+```
+
+### How to Extract Training Data
+
+```python
+from sqlalchemy import create_engine, text
+
+engine = create_engine("sqlite:////path/to/workflow.db")
+df = pd.read_sql(text("""
+    SELECT
+        t.transformation,
+        ji.local_duration        AS runtime,
+        j.exec_job_id            AS job_id,
+        h.cpu_count,
+        h.cpu_speed,
+        h.ram,
+        ji.input_bytes_total,    -- not always populated; may need kickstart parse
+        ji.input_files_count,
+        h.hostname
+    FROM job_instance ji
+    JOIN job  j ON j.job_id   = ji.job_id
+    JOIN task t ON t.job_id   = j.job_id
+    LEFT JOIN host h ON h.host_id = ji.host_id
+    WHERE ji.exitcode = 0
+      AND t.transformation NOT LIKE 'pegasus::%'
+      AND t.transformation NOT LIKE 'system::%'
+      AND ji.local_duration > 0
+"""), engine)
+```
+
+> **Note:** `input_bytes_total` is most accurately extracted by parsing the kickstart XML `<invocation>` records directly (written per-job as `.out` files). The Stampede DB does not always store this value.
 
 ---
 

@@ -653,19 +653,52 @@ pegasus-statistics -s jobs /path/to/submit/run00XX
 
 ## File Reference
 
-```
-pegasus-wms-runtime/
-├── wrappers/
-│   └── pegasus-plan                         # Python wrapper — intercepts pegasus-plan
-├── bin/
-│   └── pegasus-runtime-predictor            # Predictor binary — runs at DAG runtime
-└── packages/pegasus-python/src/Pegasus/
-    ├── runtime_predictor.py                 # Core: model, features, VAE, patch logic
-    └── models/
-        └── pegasus_oracle_model.pkl         # Trained model (place here)
-```
+### Files Created (new — did not exist in Pegasus upstream)
+
+| File | Purpose |
+|------|---------|
+| `bin/pegasus-plan` | Shell wrapper that intercepts `pegasus-plan`, captures its output, extracts the submit dir, then calls `pegasus-inject-prescripts` |
+| `scripts/pegasus-inject-prescripts` | Shell entry point — delegates to `Pegasus.cli.pegasus_inject_prescripts` via `$PEGASUS_PYTHON` |
+| `scripts/pegasus-runtime-predictor` | Shell entry point — delegates to `Pegasus.cli.pegasus_runtime_predictor` via `$PEGASUS_PYTHON` |
+| `zero-install-env.sh` | Session environment script: sets `PEGASUS_HOME`, `PYTHONPATH`, `PATH`, `PEGASUS_PYTHON`, and Montage tools. Source once per session — no pip/sudo needed |
+| `packages/pegasus-runtime/` | **New standalone Python package** — ML model, feature engineering, `.pkl` model file |
+| `packages/pegasus-runtime/src/Pegasus/runtime/predictor.py` | Core logic: `WorkflowRuntimePredictor`, `ModelContext`, `scan_sub_files`, `patch_sub_file`, `_extract_features`, VAE anomaly analysis |
+| `packages/pegasus-runtime/src/Pegasus/runtime/models/pegasus_oracle_model.pkl` | Pre-trained PegasusOracle model — 42,158 job executions, 203 transformations |
+| `packages/pegasus-runtime/setup.py` | Package definition for `pegasus-wms.runtime` — declares torch, sklearn, numpy, pandas deps |
+| `packages/pegasus-python/src/Pegasus/cli/pegasus_inject_prescripts.py` | Reads the `.dag` file after planning, injects `SCRIPT PRE` lines for every user job, skips system/infrastructure jobs |
+| `packages/pegasus-python/src/Pegasus/cli/pegasus_runtime_predictor.py` | SCRIPT PRE target — uses file locking so only the first job per level computes predictions; all others wait and read the cached JSON |
+| `RUNTIME_PREDICTION.md` | This document |
+| `PRESCRIPT_INTEGRATION.md` | Integration architecture and I/O reference |
+| `INTEGRATION_NOTES.md` | Developer notes on the integration design |
+
+### Files Modified (changed from Pegasus upstream)
+
+| File | What changed |
+|------|-------------|
+| `packages/pegasus-python/setup.py` | Added `pegasus-inject-prescripts` and `pegasus-runtime-predictor` as `console_scripts` entry points; added `"runtime": ["pegasus-wms.runtime"]` to `extras_require`; removed ML deps (moved to `pegasus-runtime`) |
+
+### Files NOT Modified
+
+All other Pegasus source files are **untouched**. The integration is purely additive:
+- No changes to the Java planner (`src/edu/isi/pegasus/`)
+- No changes to existing Python CLI tools
+- No changes to HTCondor submit file templates
+- No changes to `pegasus-kickstart`, `pegasus-transfer`, or any worker-side binary
+
+The wrapper in `bin/pegasus-plan` intercepts at the PATH level — the real `$PEGASUS_HOME/bin/pegasus-plan` runs unchanged.
+
+### Output Files (written at runtime)
+
+| File | Written by | Description |
+|------|-----------|-------------|
+| `<output_dir>/runtime_predictions.json` | `pegasus_runtime_predictor.py` | Full predictions for all jobs (all levels) |
+| `<output_dir>/runtime_predictions_LN.json` | `pegasus_runtime_predictor.py` | Per-level predictions for level N |
+| `<output_dir>/runtime_predictions_LN.csv` | `pegasus_runtime_predictor.py` | Same as JSON, tabular format |
+| `<output_dir>/prescript_timings.csv` | `pegasus_runtime_predictor.py` | Per-job prescript wall-clock time |
+| `<output_dir>/level_prediction_timings.csv` | `pegasus_runtime_predictor.py` | Per-level ML inference duration |
+| `<submit_dir>/00/00/<job>.sub` | `patch_sub_file()` in `predictor.py` | Patched in-place with `+PredictedRuntime` ClassAds |
 
 ---
 
-*Generated for Pegasus WMS 5.1.2-dev with PegasusOracle runtime prediction extension.*  
+*Generated for Pegasus WMS 5.1.2-dev with PegasusOracle runtime prediction extension.*
 *Model trained on 203 transformations · ISI, WSU, Anvil, Stampede, Expanse, OSG.*

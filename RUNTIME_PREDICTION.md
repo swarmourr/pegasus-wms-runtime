@@ -657,19 +657,11 @@ pegasus-statistics -s jobs /path/to/submit/run00XX
 
 | File | Purpose |
 |------|---------|
-| `bin/pegasus-plan` | Shell wrapper that intercepts `pegasus-plan`, captures its output, extracts the submit dir, then calls `pegasus-inject-prescripts` |
-| `scripts/pegasus-inject-prescripts` | Shell entry point — delegates to `Pegasus.cli.pegasus_inject_prescripts` via `$PEGASUS_PYTHON` |
-| `scripts/pegasus-runtime-predictor` | Shell entry point — delegates to `Pegasus.cli.pegasus_runtime_predictor` via `$PEGASUS_PYTHON` |
-| `zero-install-env.sh` | Session environment script: sets `PEGASUS_HOME`, `PYTHONPATH`, `PATH`, `PEGASUS_PYTHON`, and Montage tools. Source once per session — no pip/sudo needed |
-| `packages/pegasus-runtime/` | **New standalone Python package** — ML model, feature engineering, `.pkl` model file |
-| `packages/pegasus-runtime/src/Pegasus/runtime/predictor.py` | Core logic: `WorkflowRuntimePredictor`, `ModelContext`, `scan_sub_files`, `patch_sub_file`, `_extract_features`, VAE anomaly analysis |
-| `packages/pegasus-runtime/src/Pegasus/runtime/models/pegasus_oracle_model.pkl` | Pre-trained PegasusOracle model — 42,158 job executions, 203 transformations |
 | `packages/pegasus-runtime/setup.py` | Package definition for `pegasus-wms.runtime` — declares torch, sklearn, numpy, pandas deps |
+| `packages/pegasus-runtime/src/Pegasus/runtime/predictor.py` | Core ML logic: `WorkflowRuntimePredictor`, `ModelContext`, `scan_sub_files`, `patch_sub_file`, `_extract_features`, VAE anomaly analysis |
+| `packages/pegasus-runtime/src/Pegasus/runtime/models/pegasus_oracle_model.pkl` | Pre-trained PegasusOracle model — 42,158 job executions, 203 transformations |
 | `packages/pegasus-python/src/Pegasus/cli/pegasus_inject_prescripts.py` | Reads the `.dag` file after planning, injects `SCRIPT PRE` lines for every user job, skips system/infrastructure jobs |
-| `packages/pegasus-python/src/Pegasus/cli/pegasus_runtime_predictor.py` | SCRIPT PRE target — uses file locking so only the first job per level computes predictions; all others wait and read the cached JSON |
-| `RUNTIME_PREDICTION.md` | This document |
-| `PRESCRIPT_INTEGRATION.md` | Integration architecture and I/O reference |
-| `INTEGRATION_NOTES.md` | Developer notes on the integration design |
+| `packages/pegasus-python/src/Pegasus/cli/pegasus_runtime_predictor.py` | SCRIPT PRE target — file-locked so only the first job per level computes predictions; others wait and read cached JSON |
 
 ### Files Modified (changed from Pegasus upstream)
 
